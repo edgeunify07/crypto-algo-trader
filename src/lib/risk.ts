@@ -10,17 +10,25 @@ export interface RiskLimits {
 }
 
 export const DEFAULT_LIMITS: RiskLimits = {
-  maxOrderNotionalUSDT: 50,
-  maxDailyLossUSDT: 100,
-  maxOpenPositions: 3,
+  maxOrderNotionalUSDT: 25,
+  maxDailyLossUSDT: 5,
+  maxOpenPositions: 2,
 };
+
+export const SMALL_ACCOUNT_LIMITS: RiskLimits = DEFAULT_LIMITS;
 
 interface RiskState {
   limits: RiskLimits;
   killSwitch: boolean;
+  killReason: string | null;
   realizedPnlToday: number;
-  dayStamp: string; // YYYY-MM-DD to auto-reset daily counters
+  dayStamp: string;
   openSymbols: Set<string>;
+  consecutiveLosses: number;
+  peakEquity: number;
+  currentEquity: number;
+  lastHeartbeat: number;
+  maxDrawdownPct: number;
 }
 
 function today(): string {
@@ -34,9 +42,15 @@ function state(): RiskState {
     g.__riskState = {
       limits: { ...DEFAULT_LIMITS },
       killSwitch: false,
+      killReason: null,
       realizedPnlToday: 0,
       dayStamp: today(),
       openSymbols: new Set(),
+      consecutiveLosses: 0,
+      peakEquity: 100,
+      currentEquity: 100,
+      lastHeartbeat: Date.now(),
+      maxDrawdownPct: 0,
     };
   }
   const s = g.__riskState;
@@ -57,11 +71,47 @@ export const RiskGuard = {
     const s = state();
     return {
       killSwitch: s.killSwitch,
+      killReason: s.killReason,
       limits: s.limits,
       realizedPnlToday: s.realizedPnlToday,
       openPositions: s.openSymbols.size,
       openSymbols: [...s.openSymbols],
+      consecutiveLosses: s.consecutiveLosses,
+      maxDrawdownPct: s.maxDrawdownPct,
+      lastHeartbeat: s.lastHeartbeat,
     };
+  },
+
+  heartbeat() {
+    state().lastHeartbeat = Date.now();
+  },
+
+  checkStale(maxAgeMs = 120_000): RiskDecision {
+    const s = state();
+    if (Date.now() - s.lastHeartbeat > maxAgeMs) {
+      s.killSwitch = true;
+      s.killReason = "stale data — no heartbeat";
+      return { ok: false, reason: s.killReason };
+    }
+    return { ok: true };
+  },
+
+  updateEquity(equity: number) {
+    const s = state();
+    s.currentEquity = equity;
+    if (equity > s.peakEquity) s.peakEquity = equity;
+    const dd = s.peakEquity > 0 ? ((s.peakEquity - equity) / s.peakEquity) * 100 : 0;
+    if (dd > s.maxDrawdownPct) s.maxDrawdownPct = dd;
+    if (dd >= 15) {
+      s.killSwitch = true;
+      s.killReason = `max drawdown ${dd.toFixed(1)}%`;
+    }
+  },
+
+  tripKillSwitch(on = true, reason = "manual kill") {
+    const s = state();
+    s.killSwitch = on;
+    s.killReason = on ? reason : null;
   },
 
   setLimits(limits: Partial<RiskLimits>) {
@@ -69,14 +119,11 @@ export const RiskGuard = {
     s.limits = { ...s.limits, ...limits };
   },
 
-  tripKillSwitch(on = true) {
-    state().killSwitch = on;
-  },
-
   /** Called before placing a BUY (opening). */
   canOpen(symbol: string, notionalUSDT: number): RiskDecision {
     const s = state();
-    if (s.killSwitch) return { ok: false, reason: "kill switch is engaged" };
+    if (s.killSwitch) return { ok: false, reason: s.killReason ?? "kill switch is engaged" };
+    if (s.consecutiveLosses >= 5) return { ok: false, reason: "max consecutive losses reached" };
     if (notionalUSDT > s.limits.maxOrderNotionalUSDT)
       return { ok: false, reason: `order ${notionalUSDT} > max ${s.limits.maxOrderNotionalUSDT} USDT` };
     if (s.realizedPnlToday <= -Math.abs(s.limits.maxDailyLossUSDT))
@@ -101,5 +148,14 @@ export const RiskGuard = {
     const s = state();
     s.openSymbols.delete(symbol);
     s.realizedPnlToday += realizedPnlUSDT;
+    if (realizedPnlUSDT < 0) {
+      s.consecutiveLosses++;
+      if (s.consecutiveLosses >= 5) {
+        s.killSwitch = true;
+        s.killReason = "5 consecutive losses";
+      }
+    } else {
+      s.consecutiveLosses = 0;
+    }
   },
 };

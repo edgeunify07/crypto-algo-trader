@@ -2,12 +2,17 @@
 
 /** A single OHLCV candle. `time` is a UNIX timestamp in SECONDS (lightweight-charts convention). */
 export interface Candle {
-  time: number; // unix seconds
+  time: number; // unix seconds (open time)
   open: number;
   high: number;
   low: number;
   close: number;
   volume: number;
+  closeTime?: number;
+  quoteVolume?: number;
+  tradeCount?: number;
+  takerBuyBaseVol?: number;
+  takerBuyQuoteVol?: number;
 }
 
 /** Live ticker snapshot for one market. */

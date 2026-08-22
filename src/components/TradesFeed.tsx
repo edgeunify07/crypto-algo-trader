@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { useMarketSub, type WsTrade } from "@/lib/useMarketStream";
+import { formatIstTime } from "@/lib/time/ist";
 
 const fmt = (n: number, d = 2) => new Intl.NumberFormat("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
-const time = (ms: number) => new Date(ms).toLocaleTimeString("en-US", { hour12: false });
+const time = (ms: number) => formatIstTime(ms, true);
 
 interface T { id: number; price: number; qty: number; time: number; isBuyerMaker: boolean }
 

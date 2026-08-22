@@ -5,11 +5,11 @@ import { RiskGuard } from "@/lib/risk";
 import { configSummary } from "@/lib/binance/config";
 
 export async function GET() {
+  const bot = await BotRunner.status();
   return NextResponse.json({
-    ...BotRunner.status(),
-    events: getEvents(50),
+    ...bot,
+    events: await getEvents(100),
     risk: RiskGuard.status(),
-    config: { ...BotRunner.status().config },
     server: configSummary(),
   });
 }
@@ -24,17 +24,24 @@ export async function POST(req: NextRequest) {
 
   if (body.action === "stop") {
     BotRunner.stop();
-    return NextResponse.json({ ok: true, ...BotRunner.status() });
+    const bot = await BotRunner.status();
+    return NextResponse.json({ ok: true, ...bot, events: await getEvents(100), risk: RiskGuard.status(), server: configSummary() });
   }
 
   if (body.action === "start") {
     const c = body.config ?? {};
     if (!c.symbol || !c.strategyId) {
-      return NextResponse.json({ error: "symbol and strategyId are required" }, { status: 400 });
+      return NextResponse.json({ error: "symbol and strategyId are required — pick a strategy first" }, { status: 400 });
+    }
+    if (RiskGuard.status().killSwitch) {
+      return NextResponse.json({ error: "Kill switch is engaged — release it before starting the bot" }, { status: 409 });
     }
     const cfg: BotConfig = {
       symbol: c.symbol,
-      interval: c.interval ?? "1m",
+      universeMode: c.universeMode !== false, // default ON — scan all markets
+      symbols: c.symbols,
+      universeLimit: c.universeLimit ?? 20,
+      interval: c.interval ?? "15m",
       strategyId: c.strategyId,
       params: c.params ?? {},
       mode: c.mode === "live" ? "live" : "paper",
@@ -42,7 +49,14 @@ export async function POST(req: NextRequest) {
       pollMs: c.pollMs ?? 5000,
     };
     await BotRunner.start(cfg);
-    return NextResponse.json({ ok: true, ...BotRunner.status() });
+    const bot = await BotRunner.status();
+    return NextResponse.json({
+      ok: true,
+      ...bot,
+      events: await getEvents(100),
+      risk: RiskGuard.status(),
+      server: configSummary(),
+    });
   }
 
   return NextResponse.json({ error: "action must be 'start' or 'stop'" }, { status: 400 });

@@ -1,9 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { CandleInterval, Ticker } from "@/lib/types";
 import { useStreamTarget, useMarketSub, type WsTicker } from "@/lib/useMarketStream";
-import ChartPanel from "@/components/ChartPanel";
+import ChartPanel, { type ChartMarker } from "@/components/ChartPanel";
 import OrderBook from "@/components/OrderBook";
 import TradesFeed from "@/components/TradesFeed";
 import MarketList from "@/components/MarketList";
@@ -14,10 +14,16 @@ const fmt = (n: number, d = 2) => new Intl.NumberFormat("en-US", { minimumFracti
 
 interface FullStatus {
   running: boolean;
-  positions: { symbol: string; qty: number; entryPrice: number }[];
-  events: { time: number; symbol: string; action: string; price: number; pnl?: number; reason?: string; mode: string; live: boolean }[];
-  risk: { killSwitch: boolean; realizedPnlToday: number; limits: { maxOrderNotionalUSDT: number; maxDailyLossUSDT: number; maxOpenPositions: number } };
+  positions: { symbol: string; qty: number; entryPrice: number; entryTime?: number }[];
+  events: { time: number; symbol: string; action: string; price: number; qty?: number; pnl?: number; reason?: string; mode: string; live: boolean; clientOrderId?: string }[];
+  risk: { killSwitch: boolean; realizedPnlToday: number; currentEquity?: number; limits: { maxOrderNotionalUSDT: number; maxDailyLossUSDT: number; maxOpenPositions: number } };
   server?: { env: string; live: boolean; hasKeys: boolean; tradingEnabled: boolean };
+  lastSignal?: string | null;
+  pendingSignal?: string | null;
+  pendingReason?: string;
+  lastEvent?: FullStatus["events"][0] | null;
+  lastError?: string | null;
+  config?: { symbol?: string; interval?: string; mode?: string; tradeNotionalUSDT?: number; strategyId?: string } | null;
 }
 
 export default function Terminal() {
@@ -30,18 +36,49 @@ export default function Terminal() {
   const [mode, setMode] = useState<"paper" | "live">("paper");
   const [tradeNotional, setTradeNotional] = useState(25);
   const [status, setStatus] = useState<FullStatus | null>(null);
+  const [chartMarkers, setChartMarkers] = useState<ChartMarker[]>([]);
+  const [backtestMarkers, setBacktestMarkers] = useState<ChartMarker[]>([]);
+  const [bottomH, setBottomH] = useState(320);
+  const dragRef = useRef<{ startY: number; startH: number } | null>(null);
 
   useEffect(() => {
     fetch("/api/backtest").then((r) => r.json()).then((j) => {
       setStrategies(j.strategies ?? []);
-      if (j.strategies?.[0]) { setStrategyId(j.strategies[0].id); setParams(j.strategies[0].params); }
+      if (j.strategies?.[0]) { setStrategyId(j.strategies[0].id); setParams({ ...j.strategies[0].params }); }
     }).catch(() => {});
   }, []);
 
-  // Point the shared WebSocket at the selected market.
+  const eventsToMarkers = useCallback((events: FullStatus["events"], sym: string): ChartMarker[] => {
+    return events
+      .filter((e) => (e.action === "BUY" || e.action === "SELL") && e.symbol.toUpperCase() === sym.toUpperCase() && e.price > 0)
+      .map((e) => ({
+        time: e.time,
+        price: e.price,
+        side: e.action === "BUY" ? "buy" as const : "sell" as const,
+        reason: e.reason ?? (e.live ? "live" : e.mode),
+      }));
+  }, []);
+
+  useEffect(() => {
+    fetch(`/api/journal?format=json&symbol=${symbol}&limit=100`)
+      .then((r) => r.json())
+      .then((j) => {
+        const persisted = eventsToMarkers(j.events ?? [], symbol);
+        const bot = status?.events ? eventsToMarkers(status.events, symbol) : [];
+        const byKey = new Map<string, ChartMarker>();
+        for (const m of [...persisted, ...bot, ...backtestMarkers]) {
+          byKey.set(`${m.time}-${m.side}-${m.reason ?? ""}`, m);
+        }
+        setChartMarkers([...byKey.values()].sort((a, b) => a.time - b.time));
+      })
+      .catch(() => {
+        const bot = status?.events ? eventsToMarkers(status.events, symbol) : [];
+        setChartMarkers([...bot, ...backtestMarkers].sort((a, b) => a.time - b.time));
+      });
+  }, [symbol, status?.events, backtestMarkers, eventsToMarkers]);
+
   useStreamTarget(symbol, interval);
 
-  // Live ticker for the header, pushed over WebSocket.
   useMarketSub<WsTicker>("ticker", (d) => {
     setTicker({
       market: symbol,
@@ -56,29 +93,55 @@ export default function Terminal() {
     });
   });
 
-  // Reset the header when the symbol changes until the first WS tick arrives.
   useEffect(() => { setTicker(null); }, [symbol]);
 
   const refreshStatus = useCallback(async () => {
     try {
-      const r = await fetch("/api/bot");
+      const r = await fetch("/api/bot", { cache: "no-store" });
       const j = await r.json();
-      setStatus(j);
+      if (r.ok) setStatus(j);
     } catch { /* ignore */ }
   }, []);
 
   useEffect(() => {
     refreshStatus();
-    const id = window.setInterval(refreshStatus, 2500);
+    const ms = status?.running ? 1000 : 2500;
+    const id = window.setInterval(refreshStatus, ms);
     return () => window.clearInterval(id);
-  }, [refreshStatus]);
+  }, [refreshStatus, status?.running]);
+
+  const onResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragRef.current = { startY: e.clientY, startH: bottomH };
+    const onMove = (ev: MouseEvent) => {
+      if (!dragRef.current) return;
+      const delta = dragRef.current.startY - ev.clientY;
+      const next = Math.min(Math.max(dragRef.current.startH + delta, 160), Math.floor(window.innerHeight * 0.75));
+      setBottomH(next);
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const applyStrategy = (id: string) => {
+    setStrategyId(id);
+    const s = strategies.find((x) => x.id === id);
+    if (s) setParams({ ...s.params });
+    if (id === "confluence-scalp") setInterval("1m");
+    else if (id === "confluence-swing" && interval === "1m") setInterval("15m");
+  };
 
   const up = (ticker?.change24h ?? 0) >= 0;
   const armed = status?.server?.live;
+  const botStrategyMismatch = status?.running && status.config?.strategyId && status.config.strategyId !== strategyId;
 
   return (
     <div className="flex h-screen flex-col bg-bg text-text">
-      {/* TOP BAR */}
       <header className="flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-line px-4 py-2">
         <div className="flex items-center gap-2">
           <span className="text-base font-bold text-accent">◆ UNIFY</span>
@@ -93,6 +156,11 @@ export default function Terminal() {
         <Stat label="24h Volume" value={ticker ? `${fmt(ticker.volume, 0)}` : "—"} />
         <div className="ml-auto flex items-center gap-3 text-xs">
           {status?.running && <span className="flex items-center gap-1 text-up"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-up" />BOT RUNNING</span>}
+          {botStrategyMismatch && (
+            <span className="rounded bg-accent/20 px-2 py-0.5 text-[10px] text-accent">
+              UI: {strategyId} · bot: {status?.config?.strategyId} — restart bot to apply
+            </span>
+          )}
           <span className={`rounded px-2 py-0.5 ${armed ? "bg-down/20 text-down" : "bg-panel2 text-muted"}`}>
             {armed ? `LIVE · ${status?.server?.env}` : `SAFE · ${status?.server?.env ?? "testnet"}`}
           </span>
@@ -105,7 +173,6 @@ export default function Terminal() {
         </div>
       </header>
 
-      {/* MAIN GRID */}
       <div className="flex min-h-0 flex-1">
         <aside className="hidden w-56 shrink-0 border-r border-line bg-panel lg:block">
           <MarketList selected={symbol} onSelect={setSymbol} />
@@ -113,20 +180,27 @@ export default function Terminal() {
 
         <section className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 bg-panel">
-            <ChartPanel symbol={symbol} interval={interval} onInterval={setInterval} />
+            <ChartPanel symbol={symbol} interval={interval} onInterval={setInterval} params={params} tradeMarkers={chartMarkers} />
           </div>
-          <div className="h-[300px] shrink-0 border-t border-line bg-panel">
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize bottom panel"
+            onMouseDown={onResizeStart}
+            className="group flex h-2 shrink-0 cursor-row-resize items-center justify-center border-t border-line bg-panel2 hover:bg-accent/30"
+            title="Drag to resize"
+          >
+            <div className="h-0.5 w-10 rounded bg-muted group-hover:bg-accent" />
+          </div>
+          <div style={{ height: bottomH }} className="shrink-0 overflow-hidden bg-panel">
             <BottomTabs
               symbol={symbol}
               interval={interval}
               strategyId={strategyId}
               params={params}
               status={status}
-              onUseStrategy={(id) => {
-                setStrategyId(id);
-                const s = strategies.find((x) => x.id === id);
-                if (s) setParams(s.params);
-              }}
+              onChartMarkers={setBacktestMarkers}
+              onUseStrategy={applyStrategy}
             />
           </div>
         </section>
@@ -146,7 +220,7 @@ export default function Terminal() {
             interval={interval}
             strategies={strategies}
             strategyId={strategyId}
-            onStrategy={setStrategyId}
+            onStrategy={applyStrategy}
             params={params}
             onParams={setParams}
             mode={mode}
