@@ -199,8 +199,50 @@ export function backtest(
     }
   }
 
-  const lastClose = candles[candles.length - 1].close;
-  const endEquity = position === "long" ? qty * lastClose : cash;
+  const lastBar = candles[candles.length - 1];
+  // Force-close any open long at last bar close so return/trades reflect realized P&L after fees
+  if (position === "long" && qty > 0) {
+    const px = fillPrice(lastBar.close, "sell", costs.slippageRate);
+    const slipCost = qty * (lastBar.close - px);
+    const exitNotional = qty * px;
+    const fee = exitNotional * costs.feeRate;
+    const tds = exitNotional * costs.tdsRate;
+    totalFeesPaid += fee;
+    totalTdsPaid += tds;
+    totalSlippagePaid += slipCost;
+    const proceeds = exitNotional - fee - tds;
+    const entryNotional = qty * entryPrice;
+    const grossPnl = exitNotional - entryNotional;
+    const pnl = proceeds - entryNotional - entryFee;
+    trades.push({
+      entryTime,
+      exitTime: lastBar.time,
+      entryBar,
+      exitBar: candles.length - 1,
+      entryPrice,
+      exitPrice: px,
+      qty,
+      entryNotional,
+      exitNotional,
+      entryFee,
+      exitFee: fee,
+      slippageCost: entrySlippage + slipCost,
+      grossPnl,
+      pnl,
+      returnPct: entryNotional > 0 ? (pnl / entryNotional) * 100 : 0,
+      side: "long",
+      entryAction: "BUY",
+      exitAction: "SELL",
+      entryReason: openEntryReason ?? "signal",
+      exitReason: "eod-close",
+    });
+    cash = proceeds;
+    qty = 0;
+    position = "flat";
+  }
+
+  const lastClose = lastBar.close;
+  const endEquity = cash;
   const netProfit = endEquity - startEquity;
   const tax = netProfit > 0 ? netProfit * costs.capitalGainsRate : 0;
 

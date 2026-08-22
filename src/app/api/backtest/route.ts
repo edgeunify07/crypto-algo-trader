@@ -188,11 +188,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "all symbol backtests failed" }, { status: 422 });
     }
 
-    // Rank by win rate then return / PF
+    // Rank: positive expectancy first, then return, then win rate (skip zero-trade noise)
     const ranked = [...ok].sort((a, b) => {
-      const wr = (b.result!.winRate) - (a.result!.winRate);
-      if (Math.abs(wr) > 1) return wr;
-      return (b.result!.totalReturnPct) - (a.result!.totalReturnPct);
+      const aTrades = a.result!.numTrades;
+      const bTrades = b.result!.numTrades;
+      if (aTrades === 0 && bTrades > 0) return 1;
+      if (bTrades === 0 && aTrades > 0) return -1;
+      const exp = (b.result!.expectancy) - (a.result!.expectancy);
+      if (Math.abs(exp) > 0.01) return exp;
+      const ret = (b.result!.totalReturnPct) - (a.result!.totalReturnPct);
+      if (Math.abs(ret) > 0.05) return ret;
+      return (b.result!.winRate) - (a.result!.winRate);
     });
 
     const best = ranked[0];

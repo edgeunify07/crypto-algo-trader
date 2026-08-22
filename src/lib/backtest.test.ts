@@ -24,7 +24,8 @@ describe("backtest engine", () => {
     const result = backtest(strategy, candles, { warmup: 0 }, 10_000, ZERO_COSTS);
 
     const expectedReturn = ((prices[prices.length - 1] - prices[0]) / prices[0]) * 100;
-    expect(result.numTrades).toBe(0); // never sells
+    expect(result.numTrades).toBe(1); // force-closed at EOD
+    expect(result.trades[0]?.exitReason).toBe("eod-close");
     expect(result.buyHoldReturnPct).toBeCloseTo(expectedReturn, 4);
     // Entry at bar 1 open (= bar 0 close = 100), mark at last close 108
     expect(result.totalReturnPct).toBeCloseTo(((108 - 100) / 100) * 100, 4);

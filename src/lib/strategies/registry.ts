@@ -20,7 +20,7 @@ export const buyAndHoldBenchmark: Strategy = {
 export const confluenceSwing: Strategy = {
   id: "confluence-swing",
   name: "Confluence (Swing)",
-  description: "High-confidence only · HTF + ADX trending · ≥4 factors · 90% score gate. Fewer trades, higher win rate. Best on 15m–4h.",
+  description: "Fee-aware swing · +edge after Binance fees on tune · HTF + ADX trending · EMA/SMA confluence. Best on 15m–4h.",
   params: { ...DEFAULT_CONFLUENCE_PARAMS, mode: 0 } as unknown as Record<string, number>,
   next: confluenceStrategy.next,
 };

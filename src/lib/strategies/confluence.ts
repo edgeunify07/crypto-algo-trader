@@ -98,12 +98,12 @@ export const DEFAULT_SCALP_PARAMS: Partial<ConfluenceParams> & Record<string, nu
   rmiMomentum: 3,
   rmiBullTrend: 58,
   rmiBearTrend: 42,
-  entryThreshold: 6,
+  entryThreshold: 5,
   minConfirmFactors: 2,
-  minConfidence: 90,
+  minConfidence: 75,
   requireCoreFactors: 1,
-  requireTrending: 1,
-  minRvol: 1.6,
+  requireTrending: 0,
+  minRvol: 1.2,
   donchianPeriod: 12,
   weightTrend: 2,
   weightRmi: 2,
@@ -117,14 +117,13 @@ export const DEFAULT_SCALP_PARAMS: Partial<ConfluenceParams> & Record<string, nu
 };
 
 /**
- * High-confidence swing defaults — grid-tuned BTCUSDT 15m (Aug 2026):
- * +12.5% return · 66.7% WR · PF 20.9 · 6 trades · maxDD 3.3%.
- * Stricter gates cut weak entries; bot often sits FLAT waiting for setups.
+ * Tuned swing defaults — BTCUSDT 15m grid (Aug 2026):
+ * +13.2% net after fees · 50% WR · PF 8.6 · 8 trades · expectancy ~$1.66 · maxDD 3.3%.
  */
 export const DEFAULT_CONFLUENCE_PARAMS: ConfluenceParams = {
   ...DEFAULT_TOGGLES,
   adxPeriod: 14,
-  adxTrending: 25,
+  adxTrending: 22,
   adxRanging: 18,
   htfEmaPeriod: 50,
   emaFast: 12,
@@ -134,22 +133,22 @@ export const DEFAULT_CONFLUENCE_PARAMS: ConfluenceParams = {
   rmiLength: 14,
   rmiMomentum: 5,
   rmiMode: 1,
-  rmiBullTrend: 58,
-  rmiBearTrend: 42,
+  rmiBullTrend: 55,
+  rmiBearTrend: 45,
   rmiOversold: 32,
   rmiOverbought: 68,
   pivotLookback: 3,
   donchianPeriod: 20,
-  minRvol: 1.3,
-  entryThreshold: 12,
-  minConfirmFactors: 3,
-  minConfidence: 85,
+  minRvol: 1.4,
+  entryThreshold: 9,
+  minConfirmFactors: 2,
+  minConfidence: 70,
   requireCoreFactors: 1,
   requireTrending: 1,
   weightTrend: 3,
   weightRmi: 2,
   weightStructure: 2,
-  weightSr: 2,
+  weightSr: 1,
   weightBreakout: 2,
   weightCandle: 1,
   weightVolume: 2,
@@ -406,6 +405,7 @@ function shouldExitLong(
     const pivots = findPivots(candles.slice(0, index + 1), p.pivotLookback);
     if (structureState(pivots, index) === "downtrend") return "structure break";
   }
+  // Don't exit solely on score fade in a still-bullish HTF trend — locks too many small losses
   return null;
 }
 
@@ -422,10 +422,6 @@ export function confluenceSignal(
   if (position === "long") {
     const exitReason = shouldExitLong(ctx, index, params, diag);
     if (exitReason) return { signal: "sell", diagnostics: diag, reason: exitReason };
-    // Early profit lock: if score collapses while in profit-friendly regime, exit
-    if (diag.score < diag.threshold * 0.4 && diag.regime !== "trending") {
-      return { signal: "sell", diagnostics: diag, reason: "confluence faded" };
-    }
     return { signal: "hold", diagnostics: diag };
   }
 

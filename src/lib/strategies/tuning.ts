@@ -1,10 +1,10 @@
 /**
- * Grid-search tuner — primary objective: win rate (≥80% preferred), then PF / expectancy.
+ * Grid-search tuner — maximize net return after fees with positive expectancy.
  * Run: npm run tune
  */
 import { getHistoricalCandles } from "../data/historical";
 import { DEFAULT_CONFLUENCE_PARAMS, DEFAULT_SCALP_PARAMS } from "./confluence";
-import { BACKTEST_KEY, defaultHtfFor } from "./registry";
+import { defaultHtfFor } from "./registry";
 import { prepareConfluenceStrategy } from "./confluenceStrategy";
 import { backtestContextKey } from "../universe";
 import { backtest, BINANCE_SPOT_COSTS } from "../backtest";
@@ -24,23 +24,24 @@ export interface TuneResult {
   expectancy: number;
 }
 
-/** Heavily weight win rate — user target 80–90%. */
+/** Prefer positive net return after fees, then WR / PF, with enough trades. */
 function grade(r: BacktestResult): number {
   const trades = r.numTrades;
-  if (trades < 3) return -200;
+  if (trades < 4) return -200;
+  if (r.expectancy <= 0) return -50 + r.totalReturnPct;
+  const pf = r.profitFactor === Infinity ? 4 : Math.min(r.profitFactor, 4);
   const wr = r.winRate;
-  const pf = r.profitFactor === Infinity ? 5 : Math.min(r.profitFactor, 5);
-  const ddPenalty = r.maxDrawdownPct * 0.2;
-  const wrScore =
-    wr >= 90 ? 40 :
-    wr >= 80 ? 32 :
-    wr >= 70 ? 22 :
-    wr >= 60 ? 12 :
-    wr >= 50 ? 5 :
-    wr * 0.05;
-  const expBonus = r.expectancy > 0 ? 3 : -5;
-  const tradeBonus = trades >= 5 && trades <= 25 ? 2 : trades > 40 ? -3 : 0;
-  return wrScore + pf * 2 + r.totalReturnPct * 0.08 - ddPenalty + expBonus + tradeBonus;
+  const ddPenalty = r.maxDrawdownPct * 0.25;
+  const feeDrag = r.totalFeesPaid / Math.max(r.startEquity, 1) * 100;
+  return (
+    r.totalReturnPct * 1.5 +
+    wr * 0.15 +
+    pf * 3 +
+    r.expectancy * 8 -
+    ddPenalty -
+    feeDrag * 0.5 +
+    (trades >= 6 && trades <= 30 ? 4 : 0)
+  );
 }
 
 async function prepare(symbol: string, interval: "15m" | "1m", candles: Awaited<ReturnType<typeof getHistoricalCandles>>["candles"]) {
@@ -57,32 +58,35 @@ async function prepare(symbol: string, interval: "15m" | "1m", candles: Awaited<
 
 export async function tuneSwing(symbol = "BTCUSDT", startEquity = 100): Promise<TuneResult[]> {
   const { candles } = await getHistoricalCandles({ symbol, interval: "15m", limit: 1000, useCache: true });
+  const ctxKey = backtestContextKey(symbol);
   await prepare(symbol, "15m", candles);
 
   const grid: Record<string, number>[] = [];
-  for (const entryThreshold of [8, 10, 12, 14]) {
-    for (const minConfirmFactors of [3, 4, 5]) {
-      for (const minConfidence of [85, 90, 95]) {
-        for (const [emaFast, emaSlow] of [[12, 26], [9, 21]] as const) {
-          for (const minRvol of [1.3, 1.5, 1.8]) {
-            for (const requireTrending of [1]) {
-              grid.push({
-                ...DEFAULT_CONFLUENCE_PARAMS,
-                mode: 0,
-                entryThreshold,
-                minConfirmFactors,
-                minConfidence,
-                requireCoreFactors: 1,
-                requireTrending,
-                emaFast,
-                emaSlow,
-                smaFast: emaFast,
-                smaSlow: emaSlow,
-                minRvol,
-                allowRangingMr: 0,
-                rmiBullTrend: 58,
-                rmiBearTrend: 42,
-              });
+  for (const entryThreshold of [5, 6, 7, 8, 9]) {
+    for (const minConfirmFactors of [2, 3]) {
+      for (const minConfidence of [70, 80, 85]) {
+        for (const [emaFast, emaSlow] of [[9, 21], [12, 26]] as const) {
+          for (const minRvol of [1.0, 1.2, 1.4]) {
+            for (const requireTrending of [0, 1]) {
+              for (const allowRangingMr of [0, 1]) {
+                grid.push({
+                  ...DEFAULT_CONFLUENCE_PARAMS,
+                  mode: 0,
+                  entryThreshold,
+                  minConfirmFactors,
+                  minConfidence,
+                  requireCoreFactors: 1,
+                  requireTrending,
+                  emaFast,
+                  emaSlow,
+                  smaFast: emaFast,
+                  smaSlow: emaSlow,
+                  minRvol,
+                  allowRangingMr,
+                  rmiBullTrend: 55,
+                  rmiBearTrend: 45,
+                });
+              }
             }
           }
         }
@@ -92,7 +96,7 @@ export async function tuneSwing(symbol = "BTCUSDT", startEquity = 100): Promise<
 
   const results: TuneResult[] = [];
   for (const params of grid) {
-    const r = backtest(confluenceSwing, candles, params, startEquity, BINANCE_SPOT_COSTS);
+    const r = backtest(confluenceSwing, candles, params, startEquity, BINANCE_SPOT_COSTS, ctxKey);
     results.push({
       params,
       score: grade(r),
@@ -104,14 +108,12 @@ export async function tuneSwing(symbol = "BTCUSDT", startEquity = 100): Promise<
       expectancy: r.expectancy,
     });
   }
-  return results.sort((a, b) => {
-    if (Math.abs(b.winRate - a.winRate) > 0.5) return b.winRate - a.winRate;
-    return b.score - a.score;
-  });
+  return results.sort((a, b) => b.score - a.score);
 }
 
 export async function tuneScalp(symbol = "ETHUSDT", startEquity = 100): Promise<TuneResult[]> {
   const { candles } = await getHistoricalCandles({ symbol, interval: "1m", limit: 500, useCache: true });
+  const ctxKey = backtestContextKey(symbol);
   await prepare(symbol, "1m", candles);
 
   let aggTrades: Awaited<ReturnType<typeof fetchAggTrades>> = [];
@@ -120,19 +122,19 @@ export async function tuneScalp(symbol = "ETHUSDT", startEquity = 100): Promise<
   } catch { /* kline fallback */ }
 
   const grid: Record<string, number>[] = [];
-  for (const entryThreshold of [6, 8, 10]) {
+  for (const entryThreshold of [4, 5, 6, 7]) {
     for (const minConfirmFactors of [2, 3]) {
-      for (const minRvol of [1.4, 1.6]) {
-        for (const [targetPct, stopPct] of [[0.0018, 0.0012], [0.002, 0.0015], [0.0025, 0.0015]] as const) {
+      for (const minRvol of [1.1, 1.3, 1.5]) {
+        for (const [targetPct, stopPct] of [[0.0025, 0.0012], [0.003, 0.0015], [0.004, 0.002]] as const) {
           grid.push({
             ...DEFAULT_CONFLUENCE_PARAMS,
             ...DEFAULT_SCALP_PARAMS,
             mode: 1,
             entryThreshold,
             minConfirmFactors,
-            minConfidence: 90,
+            minConfidence: 75,
             requireCoreFactors: 1,
-            requireTrending: 1,
+            requireTrending: 0,
             minRvol,
             targetPct,
             stopPct,
@@ -150,6 +152,7 @@ export async function tuneScalp(symbol = "ETHUSDT", startEquity = 100): Promise<
       aggTrades,
       klineOnly: aggTrades.length === 0,
       maxHoldBars: 12,
+      contextKey: ctxKey,
     });
     results.push({
       params,
@@ -162,8 +165,5 @@ export async function tuneScalp(symbol = "ETHUSDT", startEquity = 100): Promise<
       expectancy: r.expectancy,
     });
   }
-  return results.sort((a, b) => {
-    if (Math.abs(b.winRate - a.winRate) > 0.5) return b.winRate - a.winRate;
-    return b.score - a.score;
-  });
+  return results.sort((a, b) => b.score - a.score);
 }
