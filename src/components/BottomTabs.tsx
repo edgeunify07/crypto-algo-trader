@@ -5,6 +5,7 @@ import type { CandleInterval } from "@/lib/types";
 import type { BacktestResult } from "@/lib/backtest";
 import AccountPanel from "./AccountPanel";
 import ArenaPanel from "./ArenaPanel";
+import AutoSelectPanel from "./AutoSelectPanel";
 import { formatIstDateTime } from "@/lib/time/ist";
 
 const fmt = (n: number, d = 2) => new Intl.NumberFormat("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
@@ -56,7 +57,7 @@ interface Props {
   onChartMarkers?: (markers: { time: number; price: number; side: "buy" | "sell"; reason?: string }[]) => void;
 }
 
-type Tab = "arena" | "account" | "positions" | "log" | "backtest" | "validation" | "optimize";
+type Tab = "autoselect" | "arena" | "account" | "positions" | "log" | "backtest" | "validation" | "optimize";
 
 interface Provenance {
   source: string;
@@ -82,7 +83,7 @@ interface ExtendedMetrics {
 }
 
 export default function BottomTabs(p: Props) {
-  const [tab, setTab] = useState<Tab>("arena");
+  const [tab, setTab] = useState<Tab>("autoselect");
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [provenance, setProvenance] = useState<Provenance | null>(null);
   const [metrics, setMetrics] = useState<ExtendedMetrics | null>(null);
@@ -205,6 +206,7 @@ export default function BottomTabs(p: Props) {
   }, [journalEvents, liveEvents]);
 
   const tabs: { id: Tab; label: string }[] = [
+    { id: "autoselect", label: "Auto-Select" },
     { id: "arena", label: "Compare Algos" },
     { id: "account", label: "Account (real)" },
     { id: "positions", label: `Bot Positions${p.status?.running ? " · live" : positions.length ? ` (${positions.length})` : ""}` },
@@ -252,6 +254,8 @@ export default function BottomTabs(p: Props) {
       {err && <div className="px-3 py-1 text-[11px] text-down">{err}</div>}
 
       <div className="scroll-thin flex-1 overflow-auto nums text-xs">
+        {tab === "autoselect" && <AutoSelectPanel />}
+
         {tab === "arena" && <ArenaPanel symbol={p.symbol} interval={p.interval} onUseStrategy={p.onUseStrategy} />}
         {tab === "account" && <AccountPanel />}
         {tab === "positions" && (
@@ -458,7 +462,7 @@ function BacktestView({ r, provenance, metrics, configHash, breakEven, scalpMeta
     ["Net Return", `${r.totalReturnPct.toFixed(2)}%`, r.totalReturnPct >= 0 ? "text-up" : "text-down"],
     ["Buy & Hold", `${r.buyHoldReturnPct.toFixed(2)}%`, ""],
     ["Sharpe", metrics ? metrics.sharpe.toFixed(2) : "—", metrics && metrics.sharpe >= 1 ? "text-up" : ""],
-    ["DSR", metrics ? metrics.deflatedSharpe.toFixed(2) : "—", ""],
+    ["P(skill)", metrics ? `${(metrics.deflatedSharpe * 100).toFixed(0)}%` : "—", metrics && metrics.deflatedSharpe >= 0.95 ? "text-up" : "text-down"],
     ["Max DD", `-${r.maxDrawdownPct.toFixed(2)}%`, "text-down"],
     ["Trades", `${r.numTrades}`, ""],
     ["Win Rate", `${r.winRate.toFixed(1)}%`, ""],
@@ -498,6 +502,13 @@ function BacktestView({ r, provenance, metrics, configHash, breakEven, scalpMeta
         <div className="border-b border-line bg-panel2 px-3 py-1 text-[10px] text-muted">
           Scalp: maker fills {(Number(scalpMeta.makerFillRatio) * 100).toFixed(0)}% · abandoned {String(scalpMeta.abandonedEntries)} · max-hold exits {String(scalpMeta.maxHoldExits)}
           {scalpMeta.klineOnly ? " · ⚠ kline-only (promotion blocked)" : " · aggTrade replay"}
+          {scalpMeta.widenedForCost ? (
+            <span className="text-down"> · ⚠ take-profit widened to the 0.45% cost floor (your target could not pay fees+slippage)</span>
+          ) : null}
+          <div className="mt-0.5 text-[9px] text-down">
+            ⚠ This models maker-limit entries with fixed brackets — NOT what the live bot executes (live uses ATR stops).
+            Do not read these numbers as live results.
+          </div>
         </div>
       )}
       {universe && universe.length > 1 && (
@@ -556,7 +567,7 @@ function ValidationView({ data }: { data: Record<string, unknown> }) {
         <Metric label="IS Return" value={`${is.totalReturnPct.toFixed(2)}%`} />
         <Metric label="OOS Return" value={`${oos.totalReturnPct.toFixed(2)}%`} />
         <Metric label="OOS Sharpe" value={oos.metrics.sharpe.toFixed(2)} />
-        <Metric label="Deflated Sharpe" value={(data.deflatedSharpe as number).toFixed(2)} />
+        <Metric label="P(skill) after N trials" value={`${((data.deflatedSharpe as number) * 100).toFixed(0)}%`} />
         <Metric label="Walk-forward windows" value={String(wf.windows)} />
         <Metric label="WF OOS Return" value={`${wf.oosReturnPct.toFixed(2)}%`} />
         <Metric label="MC median max DD" value={`${mc.medianMaxDd.toFixed(1)}%`} />
@@ -572,13 +583,17 @@ function OptimizeView({ data }: { data: Record<string, unknown> }) {
   const top = (data.top as { params: Record<string, number>; deflatedSharpe: number; totalReturnPct: number; profitFactor: number | null }[]) ?? [];
   return (
     <div className="p-3">
-      <p className="mb-2 text-[10px] text-muted">{data.trials as number} trials · pick robustness plateaus, not isolated peaks</p>
-      <Table head={["Params", "Return", "DSR", "PF"]}>
+      <p className="mb-2 text-[10px] text-muted">
+        {data.trials as number} trials · pick robustness plateaus, not isolated peaks ·
+        P(skill) is discounted for having tried {data.trials as number} configs — below 95% the winner is not
+        distinguishable from luck
+      </p>
+      <Table head={["Params", "Return", "P(skill)", "PF"]}>
         {top.map((row, i) => (
           <tr key={i} className="border-t border-line">
             <Td>{JSON.stringify(row.params)}</Td>
             <Td right>{fmtMetric(row.totalReturnPct)}%</Td>
-            <Td right>{fmtMetric(row.deflatedSharpe)}</Td>
+            <Td right>{row.deflatedSharpe == null ? "—" : `${(row.deflatedSharpe * 100).toFixed(0)}%`}</Td>
             <Td right>{fmtMetric(row.profitFactor)}</Td>
           </tr>
         ))}

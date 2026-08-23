@@ -22,6 +22,9 @@ export interface TuneResult {
   maxDrawdownPct: number;
   numTrades: number;
   expectancy: number;
+  buyHoldReturnPct: number;
+  /** Honest gate: did this config actually beat passive buy & hold? */
+  beatsBuyHold: boolean;
 }
 
 /** Prefer positive net return after fees, then WR / PF, with enough trades. */
@@ -106,6 +109,8 @@ export async function tuneSwing(symbol = "BTCUSDT", startEquity = 100): Promise<
       maxDrawdownPct: r.maxDrawdownPct,
       numTrades: r.numTrades,
       expectancy: r.expectancy,
+      buyHoldReturnPct: r.buyHoldReturnPct,
+      beatsBuyHold: r.totalReturnPct > r.buyHoldReturnPct,
     });
   }
   return results.sort((a, b) => b.score - a.score);
@@ -125,14 +130,19 @@ export async function tuneScalp(symbol = "ETHUSDT", startEquity = 100): Promise<
   for (const entryThreshold of [4, 5, 6, 7]) {
     for (const minConfirmFactors of [2, 3]) {
       for (const minRvol of [1.1, 1.3, 1.5]) {
-        for (const [targetPct, stopPct] of [[0.0025, 0.0012], [0.003, 0.0015], [0.004, 0.002]] as const) {
+        // Cost-clearing brackets only: every target ≥ MIN_TARGET_PCT (0.45%) and
+        // every stop ≥ MIN_STOP_PCT (0.6%), so a "win" survives the round-trip cost.
+        for (const [targetPct, stopPct] of [[0.005, 0.005], [0.006, 0.006], [0.008, 0.006], [0.010, 0.008]] as const) {
           grid.push({
             ...DEFAULT_CONFLUENCE_PARAMS,
             ...DEFAULT_SCALP_PARAMS,
             mode: 1,
             entryThreshold,
             minConfirmFactors,
-            minConfidence: 75,
+            // 0 = confidence gate off. This used to read 75, which was a no-op under
+            // the old (unreachable) comparison; now that minConfidence actually works
+            // it would silently cut entries, so keep the tuner's axes explicit.
+            minConfidence: 0,
             requireCoreFactors: 1,
             requireTrending: 0,
             minRvol,
@@ -154,15 +164,23 @@ export async function tuneScalp(symbol = "ETHUSDT", startEquity = 100): Promise<
       maxHoldBars: 12,
       contextKey: ctxKey,
     });
+    // Honest gate: a config is only a viable pick if it has positive after-cost
+    // expectancy AND beats passive buy & hold. Non-viable configs are forced below
+    // every viable one so tuneScalp can never *recommend* a losing strategy — if
+    // the top result is still non-viable, nothing cleared the bar (trade nothing).
+    const beatsBuyHold = r.totalReturnPct > r.buyHoldReturnPct;
+    const viable = r.expectancy > 0 && beatsBuyHold;
     results.push({
       params,
-      score: grade(r),
+      score: viable ? grade(r) : -1000 + r.totalReturnPct,
       totalReturnPct: r.totalReturnPct,
       winRate: r.winRate,
       profitFactor: r.profitFactor === Infinity ? 99 : r.profitFactor,
       maxDrawdownPct: r.maxDrawdownPct,
       numTrades: r.numTrades,
       expectancy: r.expectancy,
+      buyHoldReturnPct: r.buyHoldReturnPct,
+      beatsBuyHold,
     });
   }
   return results.sort((a, b) => b.score - a.score);

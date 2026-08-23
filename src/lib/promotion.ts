@@ -1,4 +1,4 @@
-import { getEvents } from "./executor";
+import { getEvents, unprotectedPositions } from "./executor";
 import { RiskGuard } from "./risk";
 import { getScalpBacktestMeta, makerFillRatio } from "./scalpState";
 
@@ -33,8 +33,15 @@ export async function evaluatePromotionGate(): Promise<PromotionGateResult> {
 
   const scalpMeta = getScalpBacktestMeta();
   const liveMakerRatio = makerFillRatio();
+  const unprotected = unprotectedPositions();
 
   const criteria: PromotionCriterion[] = [
+    {
+      id: "stops_attached",
+      label: "Every open position has a protective stop",
+      pass: unprotected.length === 0,
+      detail: unprotected.length ? `UNPROTECTED: ${unprotected.join(", ")}` : "all protected",
+    },
     {
       id: "min_trades",
       label: `≥${MIN_PAPER_TRADES} paper trades`,

@@ -70,8 +70,8 @@ async function runOneSymbol(opts: {
       aggTrades,
       klineOnly: aggTrades.length === 0,
       maxHoldBars: params.maxHoldBars ?? 15,
-      makerFeeRate: 0.0002,
-      takerFeeRate: 0.0005,
+      makerFeeRate: params.makerFeeRate ?? 0.001,
+      takerFeeRate: params.takerFeeRate ?? 0.001,
       contextKey: ctxKey,
     });
     scalpMeta = scalpResult.scalpMeta;
@@ -145,7 +145,9 @@ export async function POST(req: NextRequest) {
   const scalp = isScalpStrategy(strategyId);
   const costs: CostModel = {
     ...BINANCE_SPOT_COSTS,
-    feeRate: scalp ? 0.0002 : BINANCE_SPOT_COSTS.feeRate,
+    // Scalp brackets are priced by backtestScalp itself (maker/taker split); this
+    // cost model only drives the break-even display, so use the real 0.10% fee.
+    feeRate: BINANCE_SPOT_COSTS.feeRate,
     ...(body.feeRate != null ? { feeRate: body.feeRate } : {}),
     ...(body.slippageRate != null ? { slippageRate: body.slippageRate } : {}),
   };

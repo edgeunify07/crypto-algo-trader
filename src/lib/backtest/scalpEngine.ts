@@ -1,15 +1,12 @@
 import type { Candle } from "../types";
 import type { Strategy } from "../strategies/types";
 import type { AggTrade } from "../data/aggTrades";
-import {
-  aggTradesForBar,
-  makerBuyFills,
-  makerSellFills,
-} from "../data/aggTrades";
+import { aggTradesForBar } from "../data/aggTrades";
 import { intervalMs } from "../data/intervalMs";
 import type { CandleInterval } from "../types";
 import type { BacktestResult, CostModel, Trade } from "../backtest";
 import { BINANCE_SPOT_COSTS } from "../backtest";
+import { MIN_TARGET_PCT } from "../engine/protection";
 import { evaluateStrategyDetail, BACKTEST_KEY, type ContextKey } from "../engine/signals";
 
 export interface ScalpBacktestOptions {
@@ -33,9 +30,13 @@ export interface ScalpBacktestMeta {
   abandonedEntries: number;
   makerFillRatio: number;
   maxHoldExits: number;
+  /** True when the take-profit target was clamped up to the cost floor. */
+  widenedForCost: boolean;
 }
 
 const DEFAULT_MAX_HOLD = 15;
+/** Degenerate-input fallback only (see MIN_STOP_PCT in engine/protection.ts). */
+const DEFAULT_STOP_PCT = 0.006;
 
 function closeTrade(
   trades: Trade[],
@@ -47,8 +48,12 @@ function closeTrade(
   exitTime: number,
   exitPrice: number,
   exitFee: number,
+  exitSlippage: number,
   exitReason: string,
 ): number {
+  // `exitPrice` is already the executed price: for taker exits the slippage is
+  // baked into a worse price (see caller), so pnl needs no extra slippage term —
+  // `exitSlippage` is carried only for reporting. Mirrors backtest.ts recordExit.
   const exitNotional = entry.qty * exitPrice;
   const entryNotional = entry.qty * entry.entryPrice;
   const grossPnl = exitNotional - entryNotional;
@@ -65,7 +70,7 @@ function closeTrade(
     exitNotional,
     entryFee: entry.entryFee,
     exitFee,
-    slippageCost: entry.entrySlippage,
+    slippageCost: entry.entrySlippage + exitSlippage,
     grossPnl,
     pnl,
     returnPct: entryNotional > 0 ? (pnl / entryNotional) * 100 : 0,
@@ -78,33 +83,64 @@ function closeTrade(
   return exitNotional - exitFee;
 }
 
-/** Scalp backtest with aggTrade replay, maker-first, no chase, max-hold timeout. */
+/**
+ * Scalp backtest: maker-limit entry, tight bracket exits, max-hold timeout.
+ *
+ * Accounting mirrors backtest.ts so scalp and swing numbers are comparable:
+ *  - maker legs (resting limit entry, resting take-profit) pay the maker fee and
+ *    zero slippage (the honest maker advantage);
+ *  - taker legs (stop-loss, max-hold, signal exit, forced close) cross the spread
+ *    and pay the taker fee + slippage;
+ *  - the take-profit is clamped up to the round-trip cost floor (MIN_TARGET_PCT),
+ *    since a target below it is a guaranteed net loss booked as a fake win;
+ *  - a gap through the stop fills at the worse (open / actual-trade) price;
+ *  - the final open position is force-closed so win rate/expectancy include it.
+ *
+ * NOTE ON CONGRUENCE: this models a maker/tight-bracket strategy the LIVE bot
+ * does not execute — live confluence-scalp uses ATR stops via computeProtection,
+ * i.e. backtest(confluenceScalp, …, LIVE_EXIT_POLICY). Repairing the costs here
+ * does not make these numbers what live will trade.
+ */
 export function backtestScalp(
   strategy: Strategy,
   candles: Candle[],
   params: Record<string, number>,
   opts: ScalpBacktestOptions,
 ): BacktestResult & { scalpMeta: ScalpBacktestMeta } {
-  const costs: CostModel = {
-    ...BINANCE_SPOT_COSTS,
-    feeRate: opts.makerFeeRate ?? 0.0002,
-  };
-  const maxHold = opts.maxHoldBars ?? params.maxHoldBars ?? DEFAULT_MAX_HOLD;
-  const targetPct = opts.targetPct ?? params.targetPct ?? 0.002;
-  const stopPct = opts.stopPct ?? params.stopPct ?? 0.001;
-  const takerFee = opts.takerFeeRate ?? 0.0005;
-  const spread = (opts.spreadBps ?? 5) / 10_000;
+  const makerFee = opts.makerFeeRate ?? params.makerFeeRate ?? 0.001; // real Binance spot
+  const takerFee = opts.takerFeeRate ?? params.takerFeeRate ?? 0.001;
+  const slippage = BINANCE_SPOT_COSTS.slippageRate; // applied on taker legs only
+
+  let maxHold = opts.maxHoldBars ?? params.maxHoldBars ?? DEFAULT_MAX_HOLD;
+  if (!(maxHold >= 1)) maxHold = DEFAULT_MAX_HOLD; // must be ≥1 so it can't fire at held 0
+
+  // HARD target cost-floor: a take-profit below the round-trip cost cannot pay for
+  // itself — clamp it up and flag it, rather than book guaranteed-losing "wins".
+  const rawTargetPct = opts.targetPct ?? params.targetPct ?? 0.002;
+  let targetPct = rawTargetPct;
+  let widenedForCost = false;
+  if (targetPct < MIN_TARGET_PCT) { targetPct = MIN_TARGET_PCT; widenedForCost = true; }
+
+  // Faithful GIGO: do NOT silently rewrite the user's stop — a too-tight stop
+  // should SHOW as noise-driven bleed. Only guard degenerate values.
+  const rawStopPct = opts.stopPct ?? params.stopPct ?? DEFAULT_STOP_PCT;
+  const stopPct = rawStopPct > 0 && rawStopPct < 0.5 ? rawStopPct : DEFAULT_STOP_PCT;
+
+  const spread = (opts.spreadBps ?? 5) / 10_000; // maker limit offset below close
   const barMs = intervalMs(opts.interval);
   const ctxKey = opts.contextKey ?? BACKTEST_KEY;
 
   let cash = opts.startEquity;
-  let meta: ScalpBacktestMeta = {
-    klineOnly: opts.klineOnly ?? opts.aggTrades.length === 0,
+  const meta: ScalpBacktestMeta = {
+    // Force kline-only whenever there are no aggTrades, regardless of an explicit
+    // opts.klineOnly:false — otherwise the aggTrade branch silently books nothing.
+    klineOnly: opts.aggTrades.length === 0 ? true : opts.klineOnly ?? false,
     makerFills: 0,
     takerFills: 0,
     abandonedEntries: 0,
     makerFillRatio: 0,
     maxHoldExits: 0,
+    widenedForCost,
   };
 
   if (candles.length < 2) {
@@ -116,11 +152,12 @@ export function backtestScalp(
   let peakEquity = opts.startEquity;
   let maxDrawdownPct = 0;
   let totalFeesPaid = 0;
+  let totalSlippagePaid = 0;
 
   type Pos = {
     entryTime: number; entryBar: number; entryPrice: number; qty: number;
     entryFee: number; entrySlippage: number; entryReason: string;
-    stop: number; target: number;
+    stop: number; target: number; fillTime: number;
   };
   let pos: Pos | null = null;
   let pendingBuy: { bar: number; reason: string; limitPrice: number } | null = null;
@@ -130,14 +167,18 @@ export function backtestScalp(
     const barCloseSec = bar.closeTime ?? bar.time + barMs / 1000 - 1;
     const barTrades = aggTradesForBar(opts.aggTrades, bar.time, barCloseSec);
 
-    // Try fill pending maker buy at bar open — never chase across spread
+    // Fill a pending maker buy at this bar — never chase across the spread.
     if (pendingBuy && pendingBuy.bar + 1 === i && !pos) {
       const limit = pendingBuy.limitPrice;
-      const filled = meta.klineOnly
-        ? bar.low <= limit
-        : makerBuyFills(barTrades, limit);
-      if (filled) {
-        const fee = cash * costs.feeRate;
+      let fillTime: number | null = null;
+      if (meta.klineOnly) {
+        if (bar.low <= limit) fillTime = bar.time;
+      } else {
+        const hit = [...barTrades].sort((a, b) => a.time - b.time).find((t) => t.price <= limit);
+        if (hit) fillTime = hit.time;
+      }
+      if (fillTime != null) {
+        const fee = cash * makerFee;
         const qty = (cash - fee) / limit;
         pos = {
           entryTime: bar.time,
@@ -149,6 +190,7 @@ export function backtestScalp(
           entryReason: pendingBuy.reason,
           stop: limit * (1 - stopPct),
           target: limit * (1 + targetPct),
+          fillTime,
         };
         totalFeesPaid += fee;
         cash = 0;
@@ -159,67 +201,96 @@ export function backtestScalp(
       pendingBuy = null;
     }
 
-    // In-position: check stop/target via aggTrade replay (pessimistic)
+    // In-position: resolve bracket / max-hold / signal exit for this bar.
     if (pos) {
       const held = i - pos.entryBar;
-      let exitPrice: number | null = null;
+      let rawExitPrice: number | null = null;
       let exitReason = "";
+      let taker = true; // SL / max-hold / signal cross the spread; only TP is maker
 
-      if (!meta.klineOnly && barTrades.length > 0) {
+      if (meta.klineOnly) {
+        // Pessimistic kline: assume the STOP fills before the target if both are
+        // touched. A gap through the stop fills at the (worse) open, never better.
+        if (bar.low <= pos.stop) {
+          rawExitPrice = Math.min(pos.stop, bar.open);
+          exitReason = "SL-kline";
+        } else if (held > 0 && bar.high >= pos.target) {
+          // Suppress TP on the entry bar: a pre-fill high must not book a fake win.
+          rawExitPrice = pos.target;
+          exitReason = "TP-kline";
+          taker = false;
+        }
+      } else {
         const sorted = [...barTrades].sort((a, b) => a.time - b.time);
         for (const t of sorted) {
-          if (t.price <= pos.stop) { exitPrice = pos.stop; exitReason = "SL"; break; }
-          if (t.price >= pos.target) { exitPrice = pos.target; exitReason = "TP"; break; }
+          // On the entry bar only replay trades AFTER the fill (no lookahead).
+          if (held === 0 && t.time <= pos.fillTime) continue;
+          if (t.price <= pos.stop) { rawExitPrice = Math.min(pos.stop, t.price); exitReason = "SL"; break; }
+          if (t.price >= pos.target) { rawExitPrice = pos.target; exitReason = "TP"; taker = false; break; }
         }
-      } else if (meta.klineOnly) {
-        // Pessimistic kline: stop before target if both possible
-        if (bar.low <= pos.stop) { exitPrice = pos.stop; exitReason = "SL-kline"; }
-        else if (bar.high >= pos.target) { exitPrice = pos.target; exitReason = "TP-kline"; }
       }
 
-      if (held >= maxHold && !exitPrice) {
-        exitPrice = bar.close * (1 - spread);
+      if (rawExitPrice == null && held >= maxHold) {
+        rawExitPrice = bar.close;
         exitReason = "max-hold";
         meta.maxHoldExits++;
-        meta.takerFills++;
       }
 
-      const { signal } = evaluateStrategyDetail(strategy.id, candles, i, "long", params, ctxKey);
-      if (!exitPrice && signal === "sell") {
-        const limit = bar.close * (1 - spread);
-        const sold = meta.klineOnly ? bar.high >= limit : makerSellFills(barTrades, limit);
-        if (sold) {
-          exitPrice = limit;
+      if (rawExitPrice == null) {
+        const { signal } = evaluateStrategyDetail(strategy.id, candles, i, "long", params, ctxKey);
+        if (signal === "sell") {
+          rawExitPrice = bar.close; // reversal → we market out
           exitReason = "signal";
-          meta.makerFills++;
         }
       }
 
-      if (exitPrice != null) {
-        const fee = pos.qty * exitPrice * (exitReason === "max-hold" ? takerFee : costs.feeRate);
+      if (rawExitPrice != null) {
+        const execPrice = taker ? rawExitPrice * (1 - slippage) : rawExitPrice;
+        const exitSlippage = taker ? pos.qty * (rawExitPrice - execPrice) : 0;
+        const fee = pos.qty * execPrice * (taker ? takerFee : makerFee);
         totalFeesPaid += fee;
-        cash = closeTrade(trades, pos, i, bar.time, exitPrice, fee, exitReason);
+        totalSlippagePaid += exitSlippage;
+        if (taker) meta.takerFills++; else meta.makerFills++;
+        cash = closeTrade(trades, pos, i, bar.time, execPrice, fee, exitSlippage, exitReason);
         pos = null;
       }
     }
 
+    // Mark to market. Drawdown uses the bar LOW while in position — a close-only
+    // curve understates the drawdown a real account actually experiences.
     const mark = pos ? pos.qty * bar.close : cash;
+    const markLow = pos ? pos.qty * bar.low : cash;
     equityCurve.push({ time: bar.time, equity: mark });
     if (mark > peakEquity) peakEquity = mark;
-    const dd = peakEquity > 0 ? ((peakEquity - mark) / peakEquity) * 100 : 0;
+    const dd = peakEquity > 0 ? ((peakEquity - markLow) / peakEquity) * 100 : 0;
     if (dd > maxDrawdownPct) maxDrawdownPct = dd;
 
     if (i < candles.length - 1 && !pos && !pendingBuy) {
       const { signal, reason } = evaluateStrategyDetail(strategy.id, candles, i, "flat", params, ctxKey);
       if (signal === "buy") {
         const limit = bar.close * (1 - spread);
-        pendingBuy = { bar: i, reason: reason ?? (params.mode >= 1 ? "scalp" : "swing"), limitPrice: limit };
+        pendingBuy = { bar: i, reason: reason ?? ((params.mode ?? 0) >= 1 ? "scalp" : "swing"), limitPrice: limit };
       }
     }
   }
 
+  // Force-close any still-open position at the last close (taker) so its outcome
+  // counts in win rate / expectancy instead of being hidden. Mirrors backtest.ts.
+  if (pos) {
+    const lastBar = candles[candles.length - 1];
+    const raw = lastBar.close;
+    const execPrice = raw * (1 - slippage);
+    const exitSlippage = pos.qty * (raw - execPrice);
+    const fee = pos.qty * execPrice * takerFee;
+    totalFeesPaid += fee;
+    totalSlippagePaid += exitSlippage;
+    meta.takerFills++;
+    cash = closeTrade(trades, pos, candles.length - 1, lastBar.time, execPrice, fee, exitSlippage, "eod-close");
+    pos = null;
+  }
+
   const lastClose = candles[candles.length - 1].close;
-  const endEquity = pos ? pos.qty * lastClose : cash;
+  const endEquity = cash; // position (if any) force-closed above
   const totalFills = meta.makerFills + meta.takerFills;
   meta.makerFillRatio = totalFills > 0 ? meta.makerFills / totalFills : 0;
 
@@ -242,7 +313,7 @@ export function backtestScalp(
     expectancy: trades.length ? trades.reduce((s, t) => s + t.pnl, 0) / trades.length : 0,
     maxDrawdownPct,
     totalFeesPaid,
-    totalSlippagePaid: 0,
+    totalSlippagePaid,
     totalTdsPaid: 0,
     equityCurve,
     scalpMeta: meta,

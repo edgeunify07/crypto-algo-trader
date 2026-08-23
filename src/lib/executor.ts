@@ -206,6 +206,34 @@ export async function checkStops(
   return null;
 }
 
+/**
+ * Bar-aware stop check. Polling only sees the latest close, so a stop breached
+ * mid-bar would otherwise be missed entirely. Uses the bar's low/high.
+ * If both levels are touchable in the same bar we assume the STOP filled first —
+ * pessimistic on purpose, so paper results never flatter reality.
+ */
+export async function checkStopsForBar(
+  symbol: string,
+  bar: { high: number; low: number; close: number },
+  mode: ExecMode,
+  tradeNotionalUSDT: number,
+): Promise<ExecEvent | null> {
+  const pos = state().positions.get(symbol);
+  if (!pos) return null;
+  if (pos.stopLoss && bar.low <= pos.stopLoss) {
+    return executeSignal(symbol, "sell", pos.stopLoss, mode, tradeNotionalUSDT, { reason: "stop-loss" });
+  }
+  if (pos.takeProfit && bar.high >= pos.takeProfit) {
+    return executeSignal(symbol, "sell", pos.takeProfit, mode, tradeNotionalUSDT, { reason: "take-profit" });
+  }
+  return null;
+}
+
+/** True when an open position has no protective stop — unbounded downside. */
+export function unprotectedPositions(): string[] {
+  return [...state().positions.values()].filter((p) => !p.stopLoss).map((p) => p.symbol);
+}
+
 export async function exportEventsCsv(limit = 500): Promise<string> {
   const events = await getEvents(limit);
   const header = "time,symbol,action,mode,price,qty,notional,pnl,live,reason\n";

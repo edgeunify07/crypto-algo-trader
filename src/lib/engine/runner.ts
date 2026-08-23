@@ -1,7 +1,8 @@
 // Multi-symbol bot — scans universe, manages open positions, picks best BUY by score.
 import { getCandles } from "../binance/marketData";
-import { executeSignal, checkStops, getPositions, logBotEvent, type ExecMode, type ExecEvent } from "../executor";
+import { executeSignal, checkStops, checkStopsForBar, getPositions, logBotEvent, type ExecMode, type ExecEvent } from "../executor";
 import { evaluateStrategyDetail, prepareStrategyData } from "./signals";
+import { computeProtection, describeProtection } from "./protection";
 import { RiskGuard } from "../risk";
 import { loadBotSnapshot, saveBotSnapshot } from "../data/botState";
 import { liveContextKey, resolveUniverse } from "../universe";
@@ -132,9 +133,24 @@ async function fillPending(symbol: string, bar: Candle) {
     const held = getPositions().some((p) => p.symbol === symbol);
     const reason = book.pendingReason;
     if (book.pendingSignal === "buy" && !held) {
-      // Only fill if still flat overall under max positions, or this is our pick
-      s.lastEvent = await executeSignal(symbol, "buy", bar.open, cfg.mode, cfg.tradeNotionalUSDT, { reason });
-      logBotEvent(symbol, "SIGNAL", cfg.mode, `FILLED BUY @ ${bar.open.toFixed(4)} · ${reason ?? "signal"}`, bar.open);
+      // Derive a protective stop/target from ATR before the position exists.
+      // Without this every position is unprotected and checkStops() is a no-op.
+      const protection = computeProtection(book.candles, book.candles.length - 1, bar.open, {
+        stopLossAtrMult: cfg.stopLossAtrMult,
+        takeProfitRr: cfg.takeProfitRr,
+      });
+      s.lastEvent = await executeSignal(symbol, "buy", bar.open, cfg.mode, cfg.tradeNotionalUSDT, {
+        reason,
+        stopLoss: protection?.stopLoss,
+        takeProfit: protection?.takeProfit,
+      });
+      logBotEvent(
+        symbol,
+        "SIGNAL",
+        cfg.mode,
+        `FILLED BUY @ ${bar.open.toFixed(4)} · ${reason ?? "signal"}${protection ? ` · ${describeProtection(protection)}` : " · NO STOP (insufficient bars)"}`,
+        bar.open,
+      );
     } else if (book.pendingSignal === "sell" && held) {
       s.lastEvent = await executeSignal(symbol, "sell", bar.open, cfg.mode, cfg.tradeNotionalUSDT, { reason });
       logBotEvent(symbol, "SIGNAL", cfg.mode, `FILLED SELL @ ${bar.open.toFixed(4)} · ${reason ?? "signal"}`, bar.open);
@@ -232,7 +248,7 @@ async function scanUniverse() {
         book.lastFormingBar = forming;
       }
 
-      await checkStops(symbol, forming.close, cfg.mode, cfg.tradeNotionalUSDT);
+      await checkStopsForBar(symbol, forming, cfg.mode, cfg.tradeNotionalUSDT);
 
       const isNewClose = !book.lastClosedBar || lastClosed.time > book.lastClosedBar.time;
       if (isNewClose || book.candles.length < 40) {

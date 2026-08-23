@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getHistoricalCandles } from "@/lib/data/historical";
-import { prepareStrategyData, BACKTEST_KEY } from "@/lib/engine/signals";
 import { getStrategy } from "@/lib/strategies/builtin";
 import { runValidation } from "@/lib/validation/runner";
 
@@ -33,8 +32,9 @@ export async function POST(req: NextRequest) {
     const { candles } = await getHistoricalCandles({ symbol, interval, limit, useCache: true });
     if (candles.length < 60) return NextResponse.json({ error: "not enough data" }, { status: 422 });
 
-    await prepareStrategyData(strategyId, symbol, interval, candles, BACKTEST_KEY);
-    const result = runValidation(strategy, candles, params, startEquity);
+    // runValidation rebuilds the strategy context per slice itself — a single
+    // full-window prepare here would misalign every out-of-sample signal.
+    const result = await runValidation(strategy, symbol, interval, candles, params, startEquity);
 
     return NextResponse.json({ result, symbol, interval, bars: candles.length });
   } catch (err) {

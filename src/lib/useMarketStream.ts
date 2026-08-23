@@ -6,7 +6,9 @@ import { marketStream, type StreamType } from "./marketStream";
 /** Subscribe to one stream type; handler is kept in a ref so it never churns the subscription. */
 export function useMarketSub<T = unknown>(type: StreamType, handler: (data: T) => void) {
   const ref = useRef(handler);
-  ref.current = handler;
+  useEffect(() => {
+    ref.current = handler;
+  }, [handler]);
   useEffect(() => {
     return marketStream.subscribe((t, d) => {
       if (t === type) ref.current(d as T);

@@ -1,30 +1,34 @@
 import type { Candle } from "./types";
 import type { Strategy } from "./strategies/types";
 import { evaluateStrategyDetail, BACKTEST_KEY, type ContextKey } from "./engine/signals";
+import { computeProtection } from "./engine/protection";
+import { type CostModel, INDIA_SPOT_COSTS, BINANCE_SPOT_COSTS } from "./costs";
 
-export interface CostModel {
-  /** Exchange fee per trade side, as a fraction (0.001 = 0.1%). Applied to fill notional. */
-  feeRate: number;
-  /** Slippage per side as a fraction of price (0.0005 = 5 bps). Buys pay more, sells receive less. */
-  slippageRate: number;
-  /** Legacy India TDS on sell proceeds (fraction). Binance spot = 0. */
-  tdsRate: number;
-  /** Post-run capital gains tax on net profit (fraction). Not auto-applied for Binance. */
-  capitalGainsRate: number;
+export { type CostModel, INDIA_SPOT_COSTS, BINANCE_SPOT_COSTS };
+
+/**
+ * Exit rules applied in addition to the strategy's own reversal signal.
+ * These MUST mirror what the live runner does (see engine/protection.ts), or the
+ * backtest measures a strategy the bot will never actually trade.
+ */
+export interface ExitPolicy {
+  /** ATR multiple for the protective stop. Omit to disable bracket exits. */
+  stopLossAtrMult?: number;
+  /** Take-profit as a multiple of the stop distance. */
+  takeProfitRr?: number;
+  atrPeriod?: number;
+  /** Force an exit after this many bars in position. 0/undefined = no limit. */
+  maxHoldBars?: number;
+  /** Also exit on the strategy's reversal signal (default true). */
+  useSignalExit?: boolean;
 }
 
-export const INDIA_SPOT_COSTS: CostModel = {
-  feeRate: 0.005,
-  tdsRate: 0.01,
-  capitalGainsRate: 0.3,
-  slippageRate: 0.001,
-};
-
-export const BINANCE_SPOT_COSTS: CostModel = {
-  feeRate: 0.001,
-  tdsRate: 0,
-  capitalGainsRate: 0,
-  slippageRate: 0.0005,
+/** Mirrors the live bot's default protection (protection.ts). */
+export const LIVE_EXIT_POLICY: ExitPolicy = {
+  stopLossAtrMult: 2,
+  takeProfitRr: 1.5,
+  atrPeriod: 14,
+  useSignalExit: true,
 };
 
 export interface Trade {
@@ -86,10 +90,15 @@ export function backtest(
   startEquity = 10_000,
   costs: CostModel = BINANCE_SPOT_COSTS,
   contextKey: ContextKey = BACKTEST_KEY,
+  exitPolicy?: ExitPolicy,
 ): BacktestResult {
   if (candles.length < 2) {
-    return emptyResult(strategy.id, startEquity, candles, costs);
+    return emptyResult(strategy.id, startEquity, candles);
   }
+
+  const bracketOn = !!exitPolicy?.stopLossAtrMult;
+  const useSignalExit = exitPolicy?.useSignalExit ?? true;
+  const maxHoldBars = exitPolicy?.maxHoldBars ?? 0;
 
   let cash = startEquity;
   let qty = 0;
@@ -99,6 +108,8 @@ export function backtest(
   let entryBar = 0;
   let entryFee = 0;
   let entrySlippage = 0;
+  let stopLevel = 0;
+  let targetLevel = 0;
 
   let pending: "buy" | "sell" | null = null;
   let signalBar = -1;
@@ -112,6 +123,52 @@ export function backtest(
   let totalTdsPaid = 0;
   let peakEquity = startEquity;
   let maxDrawdownPct = 0;
+
+  /**
+   * Close the open long at `rawExitPrice`, booking fees, slippage and the trade.
+   * Used by signal exits, bracket (stop/target) exits and the final force-close
+   * so all three paths account identically.
+   */
+  function recordExit(rawExitPrice: number, bar: Candle, i: number, reason: string) {
+    const px = fillPrice(rawExitPrice, "sell", costs.slippageRate);
+    const slipCost = qty * (rawExitPrice - px);
+    const exitNotional = qty * px;
+    const fee = exitNotional * costs.feeRate;
+    const tds = exitNotional * costs.tdsRate;
+    totalFeesPaid += fee;
+    totalTdsPaid += tds;
+    totalSlippagePaid += slipCost;
+    const proceeds = exitNotional - fee - tds;
+    const entryNotional = qty * entryPrice;
+    const grossPnl = exitNotional - entryNotional;
+    const pnl = proceeds - entryNotional - entryFee;
+    trades.push({
+      entryTime,
+      exitTime: bar.time,
+      entryBar,
+      exitBar: i,
+      entryPrice,
+      exitPrice: px,
+      qty,
+      entryNotional,
+      exitNotional,
+      entryFee,
+      exitFee: fee,
+      slippageCost: entrySlippage + slipCost,
+      grossPnl,
+      pnl,
+      returnPct: entryNotional > 0 ? (pnl / entryNotional) * 100 : 0,
+      side: "long",
+      entryAction: "BUY",
+      exitAction: "SELL",
+      entryReason: openEntryReason ?? "signal",
+      exitReason: reason,
+    });
+    cash = proceeds;
+    qty = 0;
+    position = "flat";
+    openEntryReason = undefined;
+  }
 
   for (let i = 0; i < candles.length; i++) {
     const bar = candles[i];
@@ -135,53 +192,56 @@ export function backtest(
       pending = null;
       openEntryReason = pendingReason;
       pendingReason = undefined;
+      // Attach the same protection the live bot uses, so the backtest models the
+      // policy that will actually trade. Computed from bars up to entry only.
+      stopLevel = 0;
+      targetLevel = 0;
+      if (bracketOn) {
+        const prot = computeProtection(candles, i, entryPrice, {
+          stopLossAtrMult: exitPolicy?.stopLossAtrMult,
+          takeProfitRr: exitPolicy?.takeProfitRr,
+          atrPeriod: exitPolicy?.atrPeriod,
+        });
+        if (prot) {
+          stopLevel = prot.stopLoss;
+          targetLevel = prot.takeProfit;
+        }
+      }
     } else if (pending === "sell" && position === "long" && i === signalBar + 1) {
-      const px = fillPrice(bar.open, "sell", costs.slippageRate);
-      const slipCost = qty * (bar.open - px);
-      const exitNotional = qty * px;
-      const fee = exitNotional * costs.feeRate;
-      const tds = exitNotional * costs.tdsRate;
-      totalFeesPaid += fee;
-      totalTdsPaid += tds;
-      totalSlippagePaid += slipCost;
-      const proceeds = exitNotional - fee - tds;
-      const entryNotional = qty * entryPrice;
-      const grossPnl = exitNotional - entryNotional;
-      const pnl = proceeds - entryNotional - entryFee;
-      trades.push({
-        entryTime,
-        exitTime: bar.time,
-        entryBar,
-        exitBar: i,
-        entryPrice,
-        exitPrice: px,
-        qty,
-        entryNotional,
-        exitNotional,
-        entryFee,
-        exitFee: fee,
-        slippageCost: entrySlippage + slipCost,
-        grossPnl,
-        pnl,
-        returnPct: entryNotional > 0 ? (pnl / entryNotional) * 100 : 0,
-        side: "long",
-        entryAction: "BUY",
-        exitAction: "SELL",
-        entryReason: openEntryReason ?? "signal",
-        exitReason: pendingReason ?? "signal",
-      });
-      cash = proceeds;
-      qty = 0;
-      position = "flat";
+      recordExit(bar.open, bar, i, pendingReason ?? "signal");
       pending = null;
-      openEntryReason = undefined;
       pendingReason = undefined;
     }
 
+    // Bracket exits. The entry filled at this bar's open, so the remainder of the
+    // bar is legitimately after the fill and may be tested.
+    // Pessimistic on purpose: if both levels are touchable in one bar we assume
+    // the STOP filled first, and a gap through the stop fills at the open (worse),
+    // while a gap through the target never fills better than the target.
+    if (position === "long" && (stopLevel > 0 || targetLevel > 0)) {
+      const barsHeld = i - entryBar;
+      if (stopLevel > 0 && bar.low <= stopLevel) {
+        recordExit(Math.min(stopLevel, bar.open), bar, i, "stop-loss");
+        pending = null;
+        pendingReason = undefined;
+      } else if (targetLevel > 0 && bar.high >= targetLevel) {
+        recordExit(targetLevel, bar, i, "take-profit");
+        pending = null;
+        pendingReason = undefined;
+      } else if (maxHoldBars > 0 && barsHeld >= maxHoldBars) {
+        recordExit(bar.close, bar, i, "max-hold");
+        pending = null;
+        pendingReason = undefined;
+      }
+    }
+
+    // Mark to market. Drawdown uses the bar LOW while long: a close-only curve
+    // understates the drawdown a real account actually experiences.
     const mark = position === "long" ? qty * bar.close : cash;
+    const markLow = position === "long" ? qty * bar.low : cash;
     equityCurve.push({ time: bar.time, equity: mark });
     if (mark > peakEquity) peakEquity = mark;
-    const dd = peakEquity > 0 ? ((peakEquity - mark) / peakEquity) * 100 : 0;
+    const dd = peakEquity > 0 ? ((peakEquity - markLow) / peakEquity) * 100 : 0;
     if (dd > maxDrawdownPct) maxDrawdownPct = dd;
 
     // Signal on completed bar i → queue fill for bar i+1
@@ -191,7 +251,7 @@ export function backtest(
         pending = "buy";
         signalBar = i;
         pendingReason = reason ?? "confluence";
-      } else if (signal === "sell" && position === "long") {
+      } else if (signal === "sell" && position === "long" && useSignalExit) {
         pending = "sell";
         signalBar = i;
         pendingReason = reason ?? "exit-signal";
@@ -200,45 +260,11 @@ export function backtest(
   }
 
   const lastBar = candles[candles.length - 1];
-  // Force-close any open long at last bar close so return/trades reflect realized P&L after fees
+  // Force-close any open long at the last bar close so return/trades reflect
+  // realized P&L after fees. Without this, an open position hides its outcome
+  // from winRate/expectancy entirely.
   if (position === "long" && qty > 0) {
-    const px = fillPrice(lastBar.close, "sell", costs.slippageRate);
-    const slipCost = qty * (lastBar.close - px);
-    const exitNotional = qty * px;
-    const fee = exitNotional * costs.feeRate;
-    const tds = exitNotional * costs.tdsRate;
-    totalFeesPaid += fee;
-    totalTdsPaid += tds;
-    totalSlippagePaid += slipCost;
-    const proceeds = exitNotional - fee - tds;
-    const entryNotional = qty * entryPrice;
-    const grossPnl = exitNotional - entryNotional;
-    const pnl = proceeds - entryNotional - entryFee;
-    trades.push({
-      entryTime,
-      exitTime: lastBar.time,
-      entryBar,
-      exitBar: candles.length - 1,
-      entryPrice,
-      exitPrice: px,
-      qty,
-      entryNotional,
-      exitNotional,
-      entryFee,
-      exitFee: fee,
-      slippageCost: entrySlippage + slipCost,
-      grossPnl,
-      pnl,
-      returnPct: entryNotional > 0 ? (pnl / entryNotional) * 100 : 0,
-      side: "long",
-      entryAction: "BUY",
-      exitAction: "SELL",
-      entryReason: openEntryReason ?? "signal",
-      exitReason: "eod-close",
-    });
-    cash = proceeds;
-    qty = 0;
-    position = "flat";
+    recordExit(lastBar.close, lastBar, candles.length - 1, "eod-close");
   }
 
   const lastClose = lastBar.close;
@@ -280,7 +306,6 @@ function emptyResult(
   strategyId: string,
   startEquity: number,
   candles: Candle[],
-  costs: CostModel,
 ): BacktestResult {
   return {
     strategyId,
