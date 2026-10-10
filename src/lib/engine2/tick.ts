@@ -95,6 +95,18 @@ export interface ScreenerRowLite {
   quoteVolume24h: number;
   fundingRate: number;
   hasPosition: boolean;
+  /**
+   * Which entry gate is currently stopping a trade, and how far off it is.
+   * Without this the dashboard can only say "no trade", which is
+   * indistinguishable from the engine being broken.
+   */
+  gates: {
+    name: string;
+    required: number | string;
+    actual: number | string;
+    passed: boolean;
+  }[];
+  blockedBy: string | null;
   timeframes: Record<
     string,
     {
@@ -367,6 +379,69 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
 
     const anchorTf = blended.anchor?.timeframe ?? ANALYSIS_TIMEFRAMES[0]!;
     const entry = universe.entries.find((e) => e.symbol === symbol);
+
+    // Evaluate every entry condition, in the same order the entry logic does,
+    // so the UI can show exactly what is being waited on.
+    const anchorForGates = blended.anchor;
+    const pct = (v: number) => `${(v * 100).toFixed(0)}%`;
+    const gates: ScreenerRowLite["gates"] = [
+      {
+        name: "signal strength",
+        required: params.entry.minScore.toFixed(2),
+        actual: Math.abs(blended.score).toFixed(2),
+        passed: Math.abs(blended.score) >= params.entry.minScore,
+      },
+      {
+        name: "confidence",
+        required: pct(params.entry.minConfidence),
+        actual: pct(blended.confidence),
+        passed: blended.confidence >= params.entry.minConfidence,
+      },
+      {
+        name: "timeframe alignment",
+        required: pct(params.entry.minAlignment),
+        actual: pct(blended.alignment),
+        passed: blended.alignment >= params.entry.minAlignment,
+      },
+      {
+        name: "direction",
+        required: "long or short",
+        actual: blended.direction,
+        passed: blended.direction !== "flat",
+      },
+    ];
+
+    if (params.entry.requireElliottAgreement && anchorForGates) {
+      gates.push({
+        name: "Elliott agrees",
+        required: blended.direction,
+        actual: anchorForGates.elliott.bias,
+        passed:
+          anchorForGates.elliott.pattern !== "none" &&
+          anchorForGates.elliott.bias === blended.direction,
+      });
+    }
+    if (params.entry.requireGannAgreement && anchorForGates) {
+      gates.push({
+        name: "Gann agrees",
+        required: blended.direction,
+        actual: anchorForGates.gann.bias,
+        passed: anchorForGates.gann.bias === blended.direction,
+      });
+    }
+    if (params.entry.avoidGannTimeCycle && anchorForGates) {
+      const { nearestCycle, distance, barsSinceAnchor } = anchorForGates.gann.timeCycle;
+      const window = Math.max(1, Math.round(nearestCycle * 0.05));
+      const inWindow = nearestCycle > 0 && barsSinceAnchor > 0 && distance <= window;
+      gates.push({
+        name: "outside Gann reversal window",
+        required: `>${window} bars from ${nearestCycle}`,
+        actual: `${distance} bars away`,
+        passed: !inWindow,
+      });
+    }
+
+    const blockedBy = gates.find((g) => !g.passed)?.name ?? null;
     screener.push({
       symbol,
       price: blended.anchor?.price ?? markBySymbol[symbol] ?? 0,
@@ -380,6 +455,8 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       quoteVolume24h: entry?.quoteVolume24h ?? 0,
       fundingRate: fundingBySymbol[symbol] ?? 0,
       hasPosition: positions.some((p) => p.symbol === symbol),
+      gates,
+      blockedBy,
       timeframes: Object.fromEntries(
         [...perTimeframe.entries()].map(([tf, a]) => [
           tf,

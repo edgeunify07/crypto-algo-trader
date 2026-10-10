@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Chart from "./Chart";
 
 /**
  * Automated futures trading dashboard.
@@ -34,6 +35,8 @@ interface ScreenerRow {
   quoteVolume24h: number;
   fundingRate: number;
   hasPosition: boolean;
+  gates: { name: string; required: number | string; actual: number | string; passed: boolean }[];
+  blockedBy: string | null;
   timeframes: Record<string, TfRead>;
 }
 
@@ -119,9 +122,9 @@ const pct = (n: number, d = 1) => `${(n * 100).toFixed(d)}%`;
 const tone = (n: number) =>
   n > 0 ? "text-[var(--up)]" : n < 0 ? "text-[var(--down)]" : "text-[var(--muted)]";
 
-function timeAgo(t: number): string {
-  if (!t) return "never";
-  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+function timeAgo(t: number, now: number): string {
+  if (!t || !now) return "never";
+  const s = Math.max(0, Math.floor((now - t) / 1000));
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;
   return `${Math.floor(s / 3600)}h ago`;
@@ -138,11 +141,16 @@ export default function Home() {
   const [state, setState] = useState<State | null>(null);
   const [rows, setRows] = useState<ScreenerRow[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [tab, setTab] = useState<"live" | "scan" | "history">("live");
+  const [tab, setTab] = useState<"live" | "scan" | "chart" | "history">("live");
+  const [chartSymbol, setChartSymbol] = useState<string>("BTCUSDT");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [ticking, setTicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastTick, setLastTick] = useState<number>(0);
+  // Clock held in state rather than read during render: calling Date.now()
+  // while rendering is impure and makes the server and client disagree on
+  // first paint.
+  const [now, setNow] = useState<number>(0);
   const inFlight = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -188,11 +196,13 @@ export default function Home() {
     // state during the effect's synchronous phase, and in StrictMode it would
     // also fire two ticks on mount.
     const kick = setTimeout(() => {
+      setNow(Date.now());
       void refresh();
       void tick();
     }, 0);
     const t = setInterval(() => void tick(), TICK_MS);
     const r = setInterval(() => void refresh(), 7000);
+    const clock = setInterval(() => setNow(Date.now()), 1000);
     // Catch up immediately when the app comes back to the foreground on iOS.
     const onVisible = () => {
       if (document.visibilityState === "visible") void tick();
@@ -202,6 +212,7 @@ export default function Home() {
       clearTimeout(kick);
       clearInterval(t);
       clearInterval(r);
+      clearInterval(clock);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [tick, refresh]);
@@ -209,6 +220,14 @@ export default function Home() {
   const acct = state?.account;
   const equity = acct?.equity ?? 0;
   const totalPnl = equity - (acct?.startingBalance ?? 100);
+
+  // "Running" means a tick completed recently. There is no process to be up or
+  // down on serverless, so liveness is measured by whether the loop is
+  // actually advancing — which is the thing that matters anyway.
+  const lastTickAt = Math.max(lastTick, acct?.lastTickAt ?? 0);
+  const sinceTick = now && lastTickAt ? now - lastTickAt : Infinity;
+  const botState: "running" | "stale" | "down" =
+    sinceTick < 90_000 ? "running" : sinceTick < 15 * 60_000 ? "stale" : "down";
 
   return (
     <main className="min-h-screen pb-24">
@@ -225,9 +244,27 @@ export default function Home() {
               }`}
             />
           </div>
-          <span className="text-[10px] text-[var(--muted)] tnum">
-            {acct?.leverage ?? 3}x · tick {acct?.tickCount ?? 0} ·{" "}
-            {timeAgo(lastTick || (acct?.lastTickAt ?? 0))}
+          <span className="flex items-center gap-1.5 text-[10px] text-[var(--muted)] tnum">
+            <span
+              className="rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide"
+              style={{
+                background:
+                  botState === "running"
+                    ? "rgba(34,201,139,.15)"
+                    : botState === "stale"
+                      ? "rgba(245,185,66,.15)"
+                      : "rgba(255,85,112,.15)",
+                color:
+                  botState === "running"
+                    ? "var(--up)"
+                    : botState === "stale"
+                      ? "var(--warn)"
+                      : "var(--down)",
+              }}
+            >
+              {botState === "running" ? "auto" : botState === "stale" ? "slow" : "idle"}
+            </span>
+            {acct?.leverage ?? 3}x · {acct?.tickCount ?? 0} ticks · {timeAgo(lastTickAt, now)}
           </span>
         </div>
 
@@ -264,21 +301,23 @@ export default function Home() {
 
       {/* ---- Tabs ---- */}
       <nav className="flex gap-1 px-4 py-3">
-        {(["live", "scan", "history"] as const).map((t) => (
+        {(["live", "scan", "chart", "history"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
-            className={`flex-1 rounded-lg py-2 text-[12px] font-medium capitalize transition-colors ${
+            className={`flex-1 rounded-lg py-2 text-[11px] font-medium transition-colors ${
               tab === t
                 ? "bg-[var(--surface-2)] text-[var(--text)]"
                 : "text-[var(--muted)]"
             }`}
           >
             {t === "live"
-              ? `Positions ${state?.positions.length ? `(${state.positions.length})` : ""}`
+              ? `Positions${state?.positions.length ? ` ${state.positions.length}` : ""}`
               : t === "scan"
                 ? "Signals"
-                : `Trades ${state?.stats.trades ? `(${state.stats.trades})` : ""}`}
+                : t === "chart"
+                  ? "Chart"
+                  : `Trades${state?.stats.trades ? ` ${state.stats.trades}` : ""}`}
           </button>
         ))}
       </nav>
@@ -286,9 +325,37 @@ export default function Home() {
       <div className="px-4 space-y-2">
         {tab === "live" && <LiveTab positions={state?.positions ?? []} />}
         {tab === "scan" && (
-          <ScanTab rows={rows} expanded={expanded} setExpanded={setExpanded} />
+          <ScanTab
+            rows={rows}
+            expanded={expanded}
+            setExpanded={setExpanded}
+            onChart={(sym) => {
+              setChartSymbol(sym);
+              setTab("chart");
+            }}
+          />
         )}
-        {tab === "history" && <HistoryTab trades={trades} stats={state?.stats} />}
+        {tab === "chart" && (
+          <>
+            <div className="flex gap-1 overflow-x-auto no-bar pb-1">
+              {(rows.length > 0 ? rows.map((r) => r.symbol) : ["BTCUSDT"]).map((sym) => (
+                <button
+                  key={sym}
+                  onClick={() => setChartSymbol(sym)}
+                  className={`shrink-0 rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
+                    chartSymbol === sym
+                      ? "bg-[var(--surface-2)] text-[var(--text)]"
+                      : "bg-[var(--surface)] text-[var(--muted)]"
+                  }`}
+                >
+                  {sym.replace("USDT", "")}
+                </button>
+              ))}
+            </div>
+            <Chart symbol={chartSymbol} />
+          </>
+        )}
+        {tab === "history" && <HistoryTab trades={trades} stats={state?.stats} now={now} />}
       </div>
 
       <footer className="fixed bottom-0 inset-x-0 bg-[var(--bg)]/95 backdrop-blur border-t border-[var(--line)] px-4 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
@@ -421,10 +488,12 @@ function ScanTab({
   rows,
   expanded,
   setExpanded,
+  onChart,
 }: {
   rows: ScreenerRow[];
   expanded: string | null;
   setExpanded: (s: string | null) => void;
+  onChart: (symbol: string) => void;
 }) {
   if (rows.length === 0) {
     return <Empty>Waiting for the first scan of today&apos;s top-10 by volume…</Empty>;
@@ -474,10 +543,44 @@ function ScanTab({
                   fund {(r.fundingRate * 100).toFixed(4)}%
                 </span>
               </div>
+              <div className="mt-1 text-[9px]">
+                {r.hasPosition ? (
+                  <span className="text-[var(--accent)]">position open</span>
+                ) : r.blockedBy ? (
+                  <span className="text-[var(--muted)]">
+                    waiting on: <span className="text-[var(--warn)]">{r.blockedBy}</span>
+                  </span>
+                ) : (
+                  <span className="text-[var(--up)]">
+                    all entry conditions met — trades on the next tick
+                  </span>
+                )}
+              </div>
             </button>
 
             {open && (
               <div className="border-t border-[var(--line)] px-3 py-2 space-y-1.5">
+                <div className="space-y-1 pb-1">
+                  <div className="text-[9px] uppercase tracking-wide text-[var(--muted)]">
+                    Entry conditions
+                  </div>
+                  {r.gates.map((g) => (
+                    <div key={g.name} className="flex items-center gap-2 text-[10px]">
+                      <span className={g.passed ? "text-[var(--up)]" : "text-[var(--down)]"}>
+                        {g.passed ? "✓" : "✗"}
+                      </span>
+                      <span className="flex-1 text-[var(--muted)]">{g.name}</span>
+                      <span className="tnum text-[var(--text)]">{g.actual}</span>
+                      <span className="tnum text-[var(--muted)]">need {g.required}</span>
+                    </div>
+                  ))}
+                </div>
+                <button
+                  onClick={() => onChart(r.symbol)}
+                  className="w-full rounded-md bg-[var(--surface-2)] py-1.5 text-[10px] text-[var(--accent)]"
+                >
+                  Open chart &amp; indicators
+                </button>
                 {TF_ORDER.filter((tf) => r.timeframes[tf]).map((tf) => {
                   const t = r.timeframes[tf]!;
                   return (
@@ -548,9 +651,11 @@ function TfStrip({ timeframes }: { timeframes: Record<string, TfRead> }) {
 function HistoryTab({
   trades,
   stats,
+  now,
 }: {
   trades: Trade[];
   stats: State["stats"] | undefined;
+  now: number;
 }) {
   return (
     <>
@@ -601,7 +706,7 @@ function HistoryTab({
                 {fmtPrice(t.entryPrice)} → {fmtPrice(t.exitPrice)} · {t.rMultiple.toFixed(2)}R
               </span>
               <span>
-                fees {money(t.entryFee + t.exitFee, 4)} · {timeAgo(t.closedAt)}
+                fees {money(t.entryFee + t.exitFee, 4)} · {timeAgo(t.closedAt, now)}
               </span>
             </div>
           </div>

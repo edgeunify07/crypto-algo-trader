@@ -1,0 +1,155 @@
+import { NextResponse } from "next/server";
+import { getCandles } from "@/lib/engine2/candles";
+import { analyseTimeframe } from "@/lib/algo/screener/analyse";
+import { ema, rsi, macd, atr, bollinger, adx } from "@/lib/algo/indicators";
+import { findPivots } from "@/lib/algo/indicators/pivots";
+import { loadParams } from "@/lib/improve2/improve";
+import { isTimeframe, type Timeframe } from "@/lib/algo/types";
+import { KEYS, kv } from "@/lib/store/kv";
+import type { FuturesPosition, FuturesTrade } from "@/lib/store/account";
+
+/**
+ * Chart data for one symbol: candles, indicator series, the Elliott/Gann read,
+ * and every marker the UI needs to show what the engine did and why.
+ *
+ * Indicators are computed here rather than in the browser so the chart shows
+ * exactly the series the strategy traded on — a second implementation in the
+ * client would eventually disagree with the engine, and the chart would then
+ * be quietly lying about the decision.
+ */
+export const dynamic = "force-dynamic";
+export const maxDuration = 30;
+
+export async function GET(request: Request) {
+  const url = new URL(request.url);
+  const symbol = (url.searchParams.get("symbol") ?? "BTCUSDT").toUpperCase();
+  const tfParam = url.searchParams.get("timeframe") ?? "1h";
+  const timeframe: Timeframe = isTimeframe(tfParam) ? tfParam : "1h";
+  const limit = Math.min(300, Number(url.searchParams.get("limit") ?? "150") || 150);
+
+  try {
+    const [candles, stored, positions, trades] = await Promise.all([
+      getCandles(symbol, timeframe),
+      loadParams(),
+      kv().get<FuturesPosition[]>(KEYS.positions),
+      kv().list<FuturesTrade>(KEYS.trades, 200),
+    ]);
+
+    if (candles.length === 0) {
+      return NextResponse.json({ error: `no candles for ${symbol} ${timeframe}` }, { status: 404 });
+    }
+
+    const params = stored.params;
+    const closes = candles.map((c) => c.close);
+    const ind = params.indicators;
+
+    const emaFast = ema(closes, ind.emaFast);
+    const emaSlow = ema(closes, ind.emaSlow);
+    const rsiSeries = rsi(closes, ind.rsiPeriod);
+    const macdSeries = macd(closes, ind.macdFast, ind.macdSlow, ind.macdSignal);
+    const bb = bollinger(closes, ind.bbPeriod, ind.bbMultiplier);
+    const atrSeries = atr(candles, ind.atrPeriod);
+    const adxSeries = adx(candles, 14);
+
+    const analysis = analyseTimeframe(symbol, timeframe, candles, params);
+
+    // Swing pivots drive both the Elliott count and the Gann fan anchor, so
+    // drawing them makes those two components inspectable rather than opaque.
+    const pivots = findPivots(candles, {
+      atrMultiple: ind.zigzagAtrMultiple,
+      atrPeriod: ind.atrPeriod,
+      confirmedOnly: true,
+    }).slice(-12);
+
+    const tail = <T,>(a: T[]) => a.slice(-limit);
+    const clean = (a: number[]) =>
+      tail(a).map((v) => (Number.isFinite(v) ? Number(v.toFixed(8)) : null));
+
+    const position = (positions ?? []).find((p) => p.symbol === symbol) ?? null;
+    const firstTime = (tail(candles)[0]?.openTime) ?? 0;
+
+    return NextResponse.json(
+      {
+        symbol,
+        timeframe,
+        candles: tail(candles).map((c) => ({
+          t: c.openTime, o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume,
+        })),
+        indicators: {
+          emaFast: clean(emaFast),
+          emaSlow: clean(emaSlow),
+          emaFastPeriod: ind.emaFast,
+          emaSlowPeriod: ind.emaSlow,
+          rsi: clean(rsiSeries),
+          rsiOverbought: ind.rsiOverbought,
+          rsiOversold: ind.rsiOversold,
+          macd: clean(macdSeries.macd),
+          macdSignal: clean(macdSeries.signal),
+          macdHistogram: clean(macdSeries.histogram),
+          bbUpper: clean(bb.upper),
+          bbLower: clean(bb.lower),
+          atr: clean(atrSeries),
+          adx: clean(adxSeries.adx),
+        },
+        pivots: pivots
+          .filter((p) => p.time >= firstTime)
+          .map((p) => ({ t: p.time, price: p.price, type: p.type })),
+        analysis: analysis
+          ? {
+              score: analysis.score,
+              confidence: analysis.confidence,
+              direction: analysis.direction,
+              regime: analysis.regime,
+              atr: analysis.atr,
+              components: analysis.components,
+              elliott: {
+                pattern: analysis.elliott.pattern,
+                currentWave: analysis.elliott.currentWave,
+                bias: analysis.elliott.bias,
+                confidence: analysis.elliott.confidence,
+                targets: analysis.elliott.targets,
+                invalidation: analysis.elliott.invalidation,
+                waves: analysis.elliott.waves,
+                notes: analysis.elliott.notes,
+              },
+              gann: {
+                bias: analysis.gann.bias,
+                confidence: analysis.gann.confidence,
+                anchor: analysis.gann.anchor,
+                angles: analysis.gann.angles,
+                timeCycle: analysis.gann.timeCycle,
+                notes: analysis.gann.notes,
+              },
+              levels: analysis.levels,
+            }
+          : null,
+        position: position
+          ? {
+              side: position.side,
+              entryPrice: position.entryPrice,
+              stopLoss: position.stopLoss,
+              liquidationPrice: position.liquidationPrice,
+              takeProfits: position.takeProfits,
+              openedAt: position.openedAt,
+            }
+          : null,
+        // Executed fills on this symbol, so the chart shows what actually happened.
+        fills: trades
+          .filter((t) => t.symbol === symbol && t.closedAt >= firstTime)
+          .map((t) => ({
+            side: t.side, entryPrice: t.entryPrice, exitPrice: t.exitPrice,
+            openedAt: t.openedAt, closedAt: t.closedAt,
+            netPnl: t.netPnl, exitReason: t.exitReason,
+          })),
+        paramsVersion: stored.version,
+        updatedAt: Date.now(),
+      },
+      { headers: { "cache-control": "no-store" } },
+    );
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      { status: 500 },
+    );
+  }
+}
