@@ -3,6 +3,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chart from "./Chart";
 import BacktestPanel from "./BacktestPanel";
+import {
+  MarketList,
+  OrderBook,
+  StrategyPanel,
+  TickerBar,
+  TradeTape,
+  useBook,
+  type StrategyInfo,
+} from "./Terminal";
 
 /**
  * Automated futures trading dashboard.
@@ -110,7 +119,16 @@ interface State {
     fees: number;
     funding: number;
   };
-  params: { version: string; source: string };
+  params: {
+    version: string;
+    source: string;
+    detail?: {
+      weights: Record<string, number>;
+      indicators: Record<string, number | boolean>;
+      entry: Record<string, number | boolean>;
+      exit: Record<string, unknown>;
+    };
+  };
 }
 
 const TF_ORDER = ["5m", "15m", "1h", "4h", "1d"];
@@ -143,7 +161,6 @@ export default function Home() {
   const [rows, setRows] = useState<ScreenerRow[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [tab, setTab] = useState<"live" | "scan" | "chart" | "history">("live");
-  const [chartSymbol, setChartSymbol] = useState<string>("BTCUSDT");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [ticking, setTicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -226,6 +243,41 @@ export default function Home() {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [tick, refresh]);
+
+  /**
+   * Which symbol the terminal is showing.
+   *
+   * Derived rather than synced in an effect: until the user picks one, the
+   * view follows whatever the engine currently rates highest, and the moment
+   * they choose, their choice sticks. Writing that as an effect would mean a
+   * render showing the old symbol before correcting itself.
+   */
+  const [picked, setPicked] = useState<string | null>(null);
+  const symbol = picked ?? rows[0]?.symbol ?? "BTCUSDT";
+  const book = useBook(symbol);
+  const selectSymbol = useCallback((s: string) => setPicked(s), []);
+
+  const marketRows = rows.map((r) => ({
+    symbol: r.symbol,
+    markPrice: r.markPrice,
+    score: r.score,
+    direction: r.direction,
+    alignment: r.alignment,
+    hasPosition: r.hasPosition,
+    blockedBy: r.blockedBy,
+  }));
+
+  const selectedRow = rows.find((r) => r.symbol === symbol) ?? null;
+  const strategy: StrategyInfo | null = state?.params.detail
+    ? {
+        version: state.params.version,
+        source: state.params.source,
+        weights: state.params.detail.weights,
+        indicators: state.params.detail.indicators,
+        entry: state.params.detail.entry,
+        exit: state.params.detail.exit,
+      }
+    : null;
 
   const acct = state?.account;
   const equity = acct?.equity ?? 0;
@@ -328,20 +380,52 @@ export default function Home() {
         ))}
       </nav>
 
-      <div className="px-4 space-y-2">
+      <div className="px-3 space-y-2 2xl:px-6">
         {tab === "live" && (
-          <>
-            {/* Strongest signal first, with its chart, so the main screen
-                answers "what is it looking at right now" without a tap. */}
-            {rows.length > 0 && (
-              <>
-                <SignalHeadline row={rows[0]!} />
-                <Chart symbol={rows[0]!.symbol} />
-              </>
-            )}
-            <BacktestPanel days={30} />
-            <LiveTab positions={state?.positions ?? []} />
-          </>
+          /* One column on a phone, a terminal on anything wider. The market
+             rail and the book are the panels that need width, so they are the
+             ones that appear as the viewport grows. */
+          <div className="grid gap-2 lg:grid-cols-[210px_minmax(0,1fr)_260px] xl:grid-cols-[230px_minmax(0,1fr)_280px_300px]">
+            <div className="hidden lg:block rounded-xl bg-[var(--surface)] lg:max-h-[calc(100vh-190px)] lg:sticky lg:top-[150px] overflow-hidden">
+              <MarketList rows={marketRows} selected={symbol} onSelect={selectSymbol} />
+            </div>
+
+            <div className="min-w-0 space-y-2">
+              <TickerBar symbol={symbol} book={book} />
+              {/* Horizontal symbol rail replaces the sidebar on a phone. */}
+              <div className="flex gap-1 overflow-x-auto no-bar lg:hidden">
+                {marketRows.map((r) => (
+                  <button
+                    key={r.symbol}
+                    onClick={() => selectSymbol(r.symbol)}
+                    className={`shrink-0 rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
+                      symbol === r.symbol
+                        ? "bg-[var(--surface-2)] text-[var(--text)]"
+                        : "bg-[var(--surface)] text-[var(--muted)]"
+                    }`}
+                  >
+                    {r.symbol.replace("USDT", "")}
+                    <span className={`ml-1 tnum ${tone(r.score)}`}>
+                      {r.score >= 0 ? "+" : ""}{r.score.toFixed(2)}
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {selectedRow && <SignalHeadline row={selectedRow} />}
+              <Chart symbol={symbol} />
+              <BacktestPanel days={30} />
+              <LiveTab positions={state?.positions ?? []} />
+            </div>
+
+            <div className="hidden lg:block space-y-2 lg:sticky lg:top-[150px] self-start">
+              <OrderBook book={book} symbol={symbol} />
+              <TradeTape book={book} />
+            </div>
+
+            <div className="hidden xl:block space-y-2 xl:sticky xl:top-[150px] self-start">
+              <StrategyPanel info={strategy} gates={selectedRow?.gates ?? []} />
+            </div>
+          </div>
         )}
         {tab === "scan" && (
           <ScanTab
@@ -349,7 +433,7 @@ export default function Home() {
             expanded={expanded}
             setExpanded={setExpanded}
             onChart={(sym) => {
-              setChartSymbol(sym);
+              selectSymbol(sym);
               setTab("chart");
             }}
           />
@@ -360,9 +444,9 @@ export default function Home() {
               {(rows.length > 0 ? rows.map((r) => r.symbol) : ["BTCUSDT"]).map((sym) => (
                 <button
                   key={sym}
-                  onClick={() => setChartSymbol(sym)}
+                  onClick={() => selectSymbol(sym)}
                   className={`shrink-0 rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
-                    chartSymbol === sym
+                    symbol === sym
                       ? "bg-[var(--surface-2)] text-[var(--text)]"
                       : "bg-[var(--surface)] text-[var(--muted)]"
                   }`}
@@ -371,7 +455,14 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <Chart symbol={chartSymbol} />
+            <Chart symbol={symbol} />
+            <div className="grid gap-2 sm:grid-cols-2 lg:hidden">
+              <OrderBook book={book} symbol={symbol} />
+              <TradeTape book={book} />
+            </div>
+            <div className="xl:hidden">
+              <StrategyPanel info={strategy} gates={selectedRow?.gates ?? []} />
+            </div>
           </>
         )}
         {tab === "history" && <HistoryTab trades={trades} stats={state?.stats} now={now} />}

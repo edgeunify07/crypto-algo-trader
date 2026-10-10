@@ -14,6 +14,7 @@ import {
   type FuturesTrade,
 } from "@/lib/store/account";
 import { unrealisedPnl } from "@/lib/futures/fees";
+import { DEFAULT_PARAMS } from "@/lib/algo/strategy/params";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 30;
@@ -33,7 +34,12 @@ export async function GET() {
     store.get<FuturesPosition[]>(KEYS.positions),
     store.list<EquityPoint>(KEYS.equity, 500),
     store.list<FuturesTrade>(KEYS.trades, 100),
-    store.get<{ version: string; source: string; updatedAt: number }>(KEYS.params),
+    store.get<{
+      version: string;
+      source: string;
+      updatedAt: number;
+      params?: Record<string, unknown>;
+    }>(KEYS.params),
   ]);
 
   const acct = account ?? newAccount(STARTING_BALANCE);
@@ -96,7 +102,14 @@ export async function GET() {
         fees: trades.reduce((a, t) => a + t.entryFee + t.exitFee, 0),
         funding: trades.reduce((a, t) => a + t.fundingCost, 0),
       },
-      params: params ?? { version: "default-v1", source: "default", updatedAt: 0 },
+      params: {
+        version: params?.version ?? "default-v1",
+        source: params?.source ?? "default",
+        updatedAt: params?.updatedAt ?? 0,
+        // The panel renders these read-only; they are owned by the
+        // improvement loop, so a manual edit here would just be overwritten.
+        detail: params?.params ?? DEFAULT_PARAMS,
+      },
       equityCurve,
       updatedAt: Date.now(),
     },
