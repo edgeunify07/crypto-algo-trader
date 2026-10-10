@@ -36,6 +36,9 @@ export interface BacktestInput {
 export interface BacktestTrade {
   symbol: string;
   side: "long" | "short";
+  quantity: number;
+  /** Margin committed to the slice being closed — the most it can lose. */
+  margin: number;
   openedAt: number;
   closedAt: number;
   entryPrice: number;
@@ -121,6 +124,13 @@ export function runFuturesBacktest(
     startingBalance?: number;
     leverage?: number;
     riskPerTrade?: number;
+    /**
+     * Must match the live engine's limit. Without it the backtest happily runs
+     * one position per symbol while production caps concurrency, so the
+     * simulated account carries several times the real exposure and its
+     * results describe a strategy that is not the one being deployed.
+     */
+    maxOpenPositions?: number;
     windowBars?: number;
     /** Only trade bars closing at or after this time (warm-up still uses earlier bars). */
     from?: number;
@@ -133,6 +143,7 @@ export function runFuturesBacktest(
     startingBalance = 100,
     leverage = 3,
     riskPerTrade = 0.02,
+    maxOpenPositions = Number(process.env.MAX_OPEN_POSITIONS ?? "3"),
     windowBars = 260,
   } = options;
 
@@ -140,6 +151,7 @@ export function runFuturesBacktest(
   let peak = startingBalance;
   let maxDrawdown = 0;
   let liquidations = 0;
+  let bankrupt = false;
   const trades: BacktestTrade[] = [];
 
   interface Open {
@@ -187,6 +199,10 @@ export function runFuturesBacktest(
   let totalFees = 0;
   let totalFunding = 0;
 
+  // Latest close per symbol, refreshed as the clock advances; used to price
+  // the forced liquidation sweep if the account is wiped out.
+  const bySymbolStep = new Map<string, number[]>();
+
   const close = (
     symbol: string,
     st: { open: Open | null },
@@ -221,6 +237,8 @@ export function runFuturesBacktest(
     trades.push({
       symbol,
       side: open.side,
+      quantity: qty,
+      margin: marginShare,
       openedAt: open.openedAt,
       closedAt: time,
       entryPrice: open.entry,
@@ -357,6 +375,10 @@ export function runFuturesBacktest(
       }
 
       // --- entry on the next bar's open ---
+      if (bankrupt) continue;
+      // Concurrency cap, matching the live risk manager.
+      const openCount = [...state.values()].filter((x) => x.open !== null).length;
+      if (openCount >= maxOpenPositions) continue;
       if (!anchor || blended.direction === "flat") continue;
       if (Math.abs(blended.score) < params.entry.minScore) continue;
       if (blended.confidence < params.entry.minConfidence) continue;
@@ -415,6 +437,19 @@ export function runFuturesBacktest(
     for (const st of state.values()) if (st.open) marked += st.open.margin;
     peak = Math.max(peak, marked);
     if (peak > 0) maxDrawdown = Math.max(maxDrawdown, (peak - marked) / peak);
+
+    // A real account stops here: margin call, everything closed, no more
+    // trading. Letting the balance run negative produced returns beyond -100%,
+    // which is not a loss anyone can actually take.
+    if (!bankrupt && marked <= 0) {
+      bankrupt = true;
+      for (const [sym, st] of state) {
+        if (!st.open) continue;
+        const last = (bySymbolStep.get(sym) ?? [])[0];
+        close(sym, st, last ?? st.open.entry, "liquidation", 1, now);
+      }
+      balance = Math.max(0, balance);
+    }
   }
 
   // Close anything still open at the final price.
