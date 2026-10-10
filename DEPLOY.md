@@ -18,7 +18,13 @@ There is deliberately **no Start/Stop button**. On serverless there is no proces
 
 `fapi.binance.com` returns **HTTP 451** from several regions, including Vercel's US ones. The futures client therefore calls `https://www.binance.com/fapi/v1/*`, which proxies the same endpoints and is reachable from restricted regions, and falls back to `fapi` if that ever fails.
 
-`vercel.json` additionally pins functions to `sin1` (Singapore). Change `regions` if you prefer somewhere else; keep it outside the blocked set.
+**`vercel.json` deliberately does not set `regions`.** Pinning a function region is a Pro/Enterprise feature, and including it fails the build on Hobby. On Pro you can add it back to move functions closer to Binance:
+
+```json
+{ "regions": ["sin1"] }
+```
+
+If Binance turns out to be unreachable from whatever region your deployment lands in, `/api/v2/health` says so explicitly, and `BINANCE_FUTURES_HOSTS` lets you point the client somewhere else without a code change.
 
 ## Steps
 
@@ -53,6 +59,29 @@ There is deliberately **no Start/Stop button**. On serverless there is no proces
      Then open the **Actions** tab and enable workflows. GitHub runs schedules on a best-effort basis, so a run can be a few minutes late; the tick is idempotent and lock-protected, so a late or doubled run is harmless. GitHub also disables schedules after 60 days of repository inactivity — push a commit or hit "Run workflow" to re-arm.
 
    On Vercel Pro you can skip the Action: change the `vercel.json` cron to `* * * * *`.
+
+## If something looks wrong, check `/api/v2/health` first
+
+It needs no authentication and reports every dependency separately, because
+all of them fail with the same symptom — a dashboard full of zeroes:
+
+```bash
+curl -s https://your-app.vercel.app/api/v2/health | jq
+```
+
+```json
+{
+  "ok": true,
+  "region": "iad1",
+  "storage": { "durable": true, "writes": true },
+  "binance": { "reachable": true, "hosts": [{ "host": "https://www.binance.com", "status": 200 }] },
+  "env": { "UPSTASH_REDIS_REST_URL": true, "CRON_SECRET": true, "OPENROUTER_API_KEY": true },
+  "engine": { "ticks": 42 },
+  "problems": []
+}
+```
+
+It returns HTTP 503 while `problems` is non-empty, so an uptime monitor can watch it. `storage.writes` is a real round trip, not just "a client was constructed", and `binance.hosts` shows the per-host status — a `451` there is the geo-block, not an outage.
 
 ## Installing on iPhone
 

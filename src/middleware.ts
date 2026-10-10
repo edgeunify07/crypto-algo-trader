@@ -8,6 +8,7 @@ function isPublic(pathname: string): boolean {
     pathname.startsWith("/api/auth/") ||
     pathname.startsWith("/_next/") ||
     pathname === "/manifest.webmanifest" ||
+    pathname === "/api/v2/health" ||
     pathname === "/favicon.ico"
   );
 }
