@@ -1,0 +1,36 @@
+{
+  "name": "algo-screener",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Multi-timeframe crypto algo screener with Elliott Wave + Gann analysis, paper trading and LLM-driven strategy self-improvement.",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "bin": {
+    "algo": "./src/cli.ts"
+  },
+  "scripts": {
+    "screen": "tsx src/cli.ts screen",
+    "backtest": "tsx src/cli.ts backtest",
+    "paper": "tsx src/cli.ts paper",
+    "improve": "tsx src/cli.ts improve",
+    "live": "tsx src/cli.ts live",
+    "serve": "tsx src/cli.ts serve",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.133.0",
+    "ws": "^8.18.3",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.14",
+    "tsx": "^4.20.3",
+    "typescript": "^5.7.3",
+    "vitest": "^3.2.4"
+  }
+}

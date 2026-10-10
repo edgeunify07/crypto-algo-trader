@@ -1,0 +1,7 @@
+node_modules/
+# Runtime artifacts: kline cache, promoted params, paper-account state.
+# Anchored so it cannot swallow src/data/.
+/data/
+.env
+*.log
+scratch/
