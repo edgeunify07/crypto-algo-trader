@@ -26,34 +26,33 @@ There is deliberately **no Start/Stop button**. On serverless there is no proces
 
    Without this the app still runs, but state is in-memory and resets constantly. The dashboard shows an amber banner when storage is missing, so this failure is visible rather than silent.
 
-2. **Set environment variables** (Project Settings → Environment Variables), from `.env.example`:
-   - `CRON_SECRET` — a long random string.
-   - `OPENROUTER_API_KEY` — enables the improvement loop.
-   - Leave `AUTH_PASSWORD` empty for no login screen.
+2. **Set environment variables** in Project Settings → Environment Variables (apply to Production, Preview and Development):
+
+   | Variable | Required | Notes |
+   | --- | --- | --- |
+   | `UPSTASH_REDIS_REST_URL` | yes | injected automatically if you connect the store in step 1 |
+   | `UPSTASH_REDIS_REST_TOKEN` | yes | same |
+   | `CRON_SECRET` | yes | a long random string; also add it to GitHub secrets in step 4 |
+   | `OPENROUTER_API_KEY` | for improvement | without it the strategy trades but never self-tunes |
+   | `AUTH_PASSWORD` | no | leave empty for no login screen |
+
+   Everything else in `.env.example` has a working default.
 
 3. **Deploy.** `vercel.json` registers a daily cron at 02:00 UTC hitting `/api/v2/cron`.
 
-4. **Keep it ticking.** The Hobby plan allows Vercel Cron **once per day**, which is fine for strategy improvement but far too slow to trade on. Two things drive the loop instead:
+4. **Keep it ticking.** The Hobby plan allows Vercel Cron **once per day**, which is the right cadence for strategy improvement but far too slow to trade on. Two things drive the loop instead:
 
    - **The app itself.** While the PWA is open it calls `/api/v2/tick` every 20 seconds, and again whenever it returns to the foreground.
-   - **An external scheduler**, for when nobody has it open. Any free runner works:
+   - **`.github/workflows/tick.yml`**, already in this repo, which ticks every 5 minutes so the loop keeps running when nobody is looking. Add two repository secrets under **Settings → Secrets and variables → Actions**:
 
-     ```yaml
-     # .github/workflows/tick.yml
-     name: tick
-     on:
-       schedule: [{ cron: "*/5 * * * *" }]
-       workflow_dispatch:
-     jobs:
-       tick:
-         runs-on: ubuntu-latest
-         steps:
-           - run: |
-               curl -fsS -X POST "https://YOUR-APP.vercel.app/api/v2/tick" \
-                 -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
-     ```
+     | Secret | Value |
+     | --- | --- |
+     | `APP_URL` | `https://your-app.vercel.app` (no trailing slash) |
+     | `CRON_SECRET` | the same value you set in Vercel |
 
-     Upgrading to Vercel Pro lets you set the `vercel.json` cron to `* * * * *` and skip this.
+     Then open the **Actions** tab and enable workflows. GitHub runs schedules on a best-effort basis, so a run can be a few minutes late; the tick is idempotent and lock-protected, so a late or doubled run is harmless. GitHub also disables schedules after 60 days of repository inactivity — push a commit or hit "Run workflow" to re-arm.
+
+   On Vercel Pro you can skip the Action: change the `vercel.json` cron to `* * * * *`.
 
 ## Installing on iPhone
 
