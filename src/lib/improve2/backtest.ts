@@ -122,6 +122,10 @@ export function runFuturesBacktest(
     leverage?: number;
     riskPerTrade?: number;
     windowBars?: number;
+    /** Only trade bars closing at or after this time (warm-up still uses earlier bars). */
+    from?: number;
+    /** Only trade bars closing at or before this time. */
+    to?: number;
   } = {},
 ): BacktestResult {
   const {
@@ -154,9 +158,17 @@ export function runFuturesBacktest(
     timeframe: Timeframe;
   }
 
+  // The clock is restricted to the requested window, but the analysis windows
+  // still read bars from before it — that is what makes an out-of-sample test
+  // honest: indicators are warm, yet no trade is taken outside the window.
+  const { from, to } = options;
   const clockTimes = new Set<number>();
   for (const d of data) {
-    for (const c of d.byTimeframe.get(stepTimeframe) ?? []) clockTimes.add(c.closeTime);
+    for (const c of d.byTimeframe.get(stepTimeframe) ?? []) {
+      if (from !== undefined && c.closeTime < from) continue;
+      if (to !== undefined && c.closeTime > to) continue;
+      clockTimes.add(c.closeTime);
+    }
   }
   const clock = [...clockTimes].sort((a, b) => a - b);
   if (clock.length < 20) {
