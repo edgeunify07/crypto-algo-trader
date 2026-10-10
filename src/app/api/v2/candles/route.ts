@@ -77,22 +77,48 @@ export async function GET(request: Request) {
     }
 
     const params = stored.params;
-    const closes = candles.map((c) => c.close);
     const ind = params.indicators;
+
+    // The forming bar, fetched separately. `getCandles` returns closed bars
+    // only — feeding a partial candle to the engine would make every
+    // indicator repaint — so it is used for display series and nothing else.
+    let live: { t: number; o: number; h: number; l: number; c: number; v: number } | null = null;
+    if (wantLive) {
+      try {
+        const fresh = await fetchFuturesKlinesRaw(symbol, timeframe);
+        const lastClosed = candles.at(-1);
+        if (fresh && (!lastClosed || fresh.t > lastClosed.openTime)) live = fresh;
+      } catch {
+        // No live bar just means the chart ends at the last close.
+      }
+    }
+
+    /**
+     * Display series include the forming bar so the lines move in real time.
+     * The analysis below deliberately does not: the strategy must only ever
+     * decide on closed data, and the chart showing a provisional EMA while the
+     * engine waits for the close is the honest depiction of that.
+     */
+    const displayCandles = live
+      ? [...candles, { ...live, openTime: live.t, open: live.o, high: live.h, low: live.l,
+          close: live.c, volume: live.v, closeTime: live.t, quoteVolume: 0, trades: 0, closed: false }]
+      : candles;
+    const closes = displayCandles.map((c) => c.close);
 
     const emaFast = ema(closes, ind.emaFast);
     const emaSlow = ema(closes, ind.emaSlow);
     const rsiSeries = rsi(closes, ind.rsiPeriod);
     const macdSeries = macd(closes, ind.macdFast, ind.macdSlow, ind.macdSignal);
     const bb = bollinger(closes, ind.bbPeriod, ind.bbMultiplier);
-    const atrSeries = atr(candles, ind.atrPeriod);
-    const adxSeries = adx(candles, 14);
+    const atrSeries = atr(displayCandles, ind.atrPeriod);
+    const adxSeries = adx(displayCandles, 14);
 
+    // Closed bars only — this is what the engine actually decides on.
     const analysis = analyseTimeframe(symbol, timeframe, candles, params);
 
     // Swing pivots drive both the Elliott count and the Gann fan anchor, so
     // drawing them makes those two components inspectable rather than opaque.
-    const pivots = findPivots(candles, {
+    const pivots = findPivots(displayCandles, {
       atrMultiple: ind.zigzagAtrMultiple,
       atrPeriod: ind.atrPeriod,
       confirmedOnly: true,
@@ -103,28 +129,17 @@ export async function GET(request: Request) {
       tail(a).map((v) => (Number.isFinite(v) ? Number(v.toFixed(8)) : null));
 
     const position = (positions ?? []).find((p) => p.symbol === symbol) ?? null;
-    const firstTime = (tail(candles)[0]?.openTime) ?? 0;
-
-    let live: { t: number; o: number; h: number; l: number; c: number; v: number } | null = null;
-    if (wantLive) {
-      try {
-        const fresh = await fetchFuturesKlinesRaw(symbol, timeframe);
-        if (fresh) live = fresh;
-      } catch {
-        // A missing live bar just means the chart ends at the last close.
-      }
-    }
+    const firstTime = (tail(displayCandles)[0]?.openTime) ?? 0;
 
     return NextResponse.json(
       {
         symbol,
         timeframe,
-        candles: [
-          ...tail(candles).map((c) => ({
-            t: c.openTime, o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume,
-          })),
-          ...(live && live.t > (tail(candles).at(-1)?.openTime ?? 0) ? [live] : []),
-        ],
+        candles: tail(displayCandles).map((c) => ({
+          t: c.openTime, o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume,
+          // Marks the still-forming bar so the chart can render it distinctly.
+          live: c.closed === false,
+        })),
         liveBar: live !== null,
         indicators: {
           emaFast: clean(emaFast),

@@ -20,6 +20,8 @@ interface Candle {
   l: number;
   c: number;
   v: number;
+  /** True for the bar still forming; drawn hollow. */
+  live?: boolean;
 }
 
 interface Component {
@@ -91,21 +93,13 @@ export interface ChartData {
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
 /**
- * Refresh cadence per timeframe.
- *
- * A 1m chart prints a new bar every minute, so polling it every 15s is the
- * difference between a live chart and a stale one. Slower timeframes gain
- * nothing from fast polling — the bar has not changed — so they back off and
- * leave the rate limit alone.
+ * Every timeframe polls fast, because on all of them the bar currently forming
+ * moves with price — a 1d chart's last candle changes just as continuously as
+ * a 1m one, it simply takes longer to close. The cost is bounded: the closed
+ * bars are served from cache keyed to the timeframe, so a poll only fetches
+ * the one forming bar and recomputes the indicator series over it.
  */
-const REFRESH_MS: Record<string, number> = {
-  "1m": 4000,
-  "5m": 8000,
-  "15m": 15000,
-  "1h": 20000,
-  "4h": 30000,
-  "1d": 60000,
-};
+const REFRESH_MS = 3500;
 
 const UP = "#22c98b";
 const DOWN = "#ff5570";
@@ -153,7 +147,7 @@ export default function Chart({ symbol }: { symbol: string }) {
       setLoading(true);
       void load();
     }, 0);
-    const id = setInterval(load, REFRESH_MS[timeframe] ?? 15_000);
+    const id = setInterval(load, REFRESH_MS);
     return () => {
       cancelled = true;
       clearTimeout(kick);
@@ -275,7 +269,9 @@ export default function Chart({ symbol }: { symbol: string }) {
                     y={Math.min(yO, yC)}
                     width={geom.bw}
                     height={Math.max(1, Math.abs(yC - yO))}
-                    fill={colour}
+                    fill={c.live ? "none" : colour}
+                    stroke={c.live ? colour : "none"}
+                    strokeWidth={c.live ? 1.2 : 0}
                   />
                 </g>
               );
@@ -361,7 +357,7 @@ export default function Chart({ symbol }: { symbol: string }) {
             <Legend colour="#f5b942" label={`EMA${data.indicators.emaSlowPeriod}`} />
             <Legend colour="#3a4a63" label="Bollinger" />
             <Legend colour="#a78bfa" label="RSI" />
-            <span className="ml-auto">pivots ○ · fills ▲■</span>
+            <span className="ml-auto">pivots ○ · fills ▲■ · hollow = forming</span>
           </div>
 
           {data.analysis && <Readout data={data} />}
