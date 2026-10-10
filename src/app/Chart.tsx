@@ -88,7 +88,24 @@ export interface ChartData {
   }[];
 }
 
-const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"];
+const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
+
+/**
+ * Refresh cadence per timeframe.
+ *
+ * A 1m chart prints a new bar every minute, so polling it every 15s is the
+ * difference between a live chart and a stale one. Slower timeframes gain
+ * nothing from fast polling — the bar has not changed — so they back off and
+ * leave the rate limit alone.
+ */
+const REFRESH_MS: Record<string, number> = {
+  "1m": 4000,
+  "5m": 8000,
+  "15m": 15000,
+  "1h": 20000,
+  "4h": 30000,
+  "1d": 60000,
+};
 
 const UP = "#22c98b";
 const DOWN = "#ff5570";
@@ -106,13 +123,14 @@ export default function Chart({ symbol }: { symbol: string }) {
   const [data, setData] = useState<ChartData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [tickAt, setTickAt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
         const res = await fetch(
-          `/api/v2/candles?symbol=${symbol}&timeframe=${timeframe}&limit=120`,
+          `/api/v2/candles?symbol=${symbol}&timeframe=${timeframe}&limit=80&live=1`,
           { cache: "no-store" },
         );
         const body = (await res.json()) as ChartData & { error?: string };
@@ -120,6 +138,7 @@ export default function Chart({ symbol }: { symbol: string }) {
         if (body.error) setError(body.error);
         else {
           setData(body);
+          setTickAt(Date.now());
           setError(null);
         }
       } catch {
@@ -134,7 +153,7 @@ export default function Chart({ symbol }: { symbol: string }) {
       setLoading(true);
       void load();
     }, 0);
-    const id = setInterval(load, 15_000);
+    const id = setInterval(load, REFRESH_MS[timeframe] ?? 15_000);
     return () => {
       cancelled = true;
       clearTimeout(kick);
@@ -196,7 +215,12 @@ export default function Chart({ symbol }: { symbol: string }) {
   return (
     <div className="rounded-xl bg-[var(--surface)] overflow-hidden">
       {/* timeframe switcher */}
-      <div className="flex gap-1 px-2 pt-2">
+      <div className="flex items-center gap-1 px-2 pt-2">
+        <span
+          key={tickAt}
+          className="live-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--up)]"
+          title="updating live"
+        />
         {TIMEFRAMES.map((tf) => (
           <button
             key={tf}

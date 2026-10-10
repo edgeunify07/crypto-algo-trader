@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chart from "./Chart";
+import BacktestPanel from "./BacktestPanel";
 
 /**
  * Automated futures trading dashboard.
@@ -151,18 +152,27 @@ export default function Home() {
   // while rendering is impure and makes the server and client disagree on
   // first paint.
   const [now, setNow] = useState<number>(0);
+  const [health, setHealth] = useState<{
+    region?: string;
+    storage?: { durable: boolean; writes: boolean; error: string | null };
+    env?: Record<string, boolean>;
+    problems?: string[];
+  } | null>(null);
   const inFlight = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [s, sc, tr] = await Promise.all([
+      const [s, sc, tr, h] = await Promise.all([
         fetch("/api/v2/state", { cache: "no-store" }).then((r) => r.json()),
         fetch("/api/v2/screener", { cache: "no-store" }).then((r) => r.json()),
         fetch("/api/v2/trades?limit=50", { cache: "no-store" }).then((r) => r.json()),
+        // Probed so a misconfiguration can be named rather than guessed at.
+        fetch("/api/v2/health", { cache: "no-store" }).then((r) => r.json()).catch(() => null),
       ]);
       if (s?.account) setState(s);
       if (Array.isArray(sc?.rows)) setRows(sc.rows);
       if (Array.isArray(tr?.trades)) setTrades(tr.trades);
+      if (h) setHealth(h);
       setError(null);
     } catch {
       setError("Cannot reach the server");
@@ -230,7 +240,7 @@ export default function Home() {
     sinceTick < 90_000 ? "running" : sinceTick < 15 * 60_000 ? "stale" : "down";
 
   return (
-    <main className="min-h-screen pb-24">
+    <main className="min-h-screen overflow-x-hidden pb-24">
       {/* ---- Equity header ---- */}
       <header className="sticky top-0 z-20 bg-[var(--bg)]/95 backdrop-blur border-b border-[var(--line)] px-4 pt-3 pb-3">
         <div className="flex items-center justify-between mb-1">
@@ -288,11 +298,7 @@ export default function Home() {
           <Stat label="Draw" value={pct(acct?.drawdown ?? 0)} />
         </div>
 
-        {state && !state.durable && (
-          <Banner tone="warn">
-            Storage is not configured — state resets. Add Upstash Redis env vars.
-          </Banner>
-        )}
+        {state && !state.durable && <StorageWarning health={health} />}
         {acct?.haltedReason && (
           <Banner tone="down">Entries halted: {acct.haltedReason}</Banner>
         )}
@@ -323,7 +329,20 @@ export default function Home() {
       </nav>
 
       <div className="px-4 space-y-2">
-        {tab === "live" && <LiveTab positions={state?.positions ?? []} />}
+        {tab === "live" && (
+          <>
+            {/* Strongest signal first, with its chart, so the main screen
+                answers "what is it looking at right now" without a tap. */}
+            {rows.length > 0 && (
+              <>
+                <SignalHeadline row={rows[0]!} />
+                <Chart symbol={rows[0]!.symbol} />
+              </>
+            )}
+            <BacktestPanel days={30} />
+            <LiveTab positions={state?.positions ?? []} />
+          </>
+        )}
         {tab === "scan" && (
           <ScanTab
             rows={rows}
@@ -368,12 +387,109 @@ export default function Home() {
   );
 }
 
+/** The single strongest signal, summarised above its chart. */
+function SignalHeadline({ row }: { row: ScreenerRow }) {
+  const long = row.direction === "long";
+  const flat = row.direction === "flat";
+  return (
+    <div className="rounded-xl bg-[var(--surface)] px-3 py-2.5">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-semibold text-[15px]">{row.symbol.replace("USDT", "")}</span>
+          <span
+            className="rounded px-1.5 py-0.5 text-[9px] font-semibold uppercase"
+            style={{
+              background: flat
+                ? "var(--surface-2)"
+                : long
+                  ? "rgba(34,201,139,.15)"
+                  : "rgba(255,85,112,.15)",
+              color: flat ? "var(--muted)" : long ? "var(--up)" : "var(--down)",
+            }}
+          >
+            {row.direction}
+          </span>
+          <span className="text-[10px] text-[var(--muted)] tnum">
+            {row.anchorTimeframe} · {row.style}
+          </span>
+        </div>
+        <span className={`tnum text-[15px] font-semibold ${tone(row.score)}`}>
+          {row.score >= 0 ? "+" : ""}{row.score.toFixed(2)}
+        </span>
+      </div>
+      <div className="mt-1.5 text-[10px]">
+        {row.hasPosition ? (
+          <span className="text-[var(--accent)]">position open</span>
+        ) : row.blockedBy ? (
+          <span className="text-[var(--muted)]">
+            waiting on <span className="text-[var(--warn)]">{row.blockedBy}</span>
+            {" · "}
+            {row.gates.filter((g) => g.passed).length}/{row.gates.length} conditions met
+          </span>
+        ) : (
+          <span className="text-[var(--up)]">all conditions met — trades on the next tick</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function Stat({ label, value, cls }: { label: string; value: string; cls?: string }) {
   return (
     <div className="rounded-lg bg-[var(--surface)] px-2 py-1.5">
       <div className="text-[9px] uppercase tracking-wide text-[var(--muted)]">{label}</div>
       <div className={`tnum text-[12px] font-medium ${cls ?? ""}`}>{value}</div>
     </div>
+  );
+}
+
+/**
+ * Storage warning that says which half of the problem applies.
+ *
+ * "Add the env vars" is unhelpful when they have already been added — on
+ * Vercel they only reach a function on the next deployment, which is the
+ * common case. The health probe distinguishes the two.
+ */
+function StorageWarning({
+  health,
+}: {
+  health: { region?: string; env?: Record<string, boolean>; storage?: { writes: boolean; error: string | null } } | null;
+}) {
+  const env = health?.env;
+  const hasUrl = env?.UPSTASH_REDIS_REST_URL;
+  const hasToken = env?.UPSTASH_REDIS_REST_TOKEN;
+  const missing = [
+    !hasUrl && "UPSTASH_REDIS_REST_URL",
+    !hasToken && "UPSTASH_REDIS_REST_TOKEN",
+  ].filter(Boolean) as string[];
+
+  if (env && missing.length === 0) {
+    // Variables are present but the round trip failed: a credential or
+    // network problem, not a missing setting.
+    return (
+      <Banner tone="down">
+        Upstash variables are set but the connection failed
+        {health?.storage?.error ? `: ${health.storage.error}` : "."} Check the
+        token is current and the database is not paused.
+      </Banner>
+    );
+  }
+
+  return (
+    <Banner tone="warn">
+      {missing.length > 0 ? (
+        <>
+          Not visible to this deployment: {missing.join(", ")}.{" "}
+          <strong>Vercel only applies new variables on a fresh deployment</strong> —
+          add them, then redeploy.
+        </>
+      ) : (
+        <>Storage is not configured — state resets on every request.</>
+      )}
+      {health?.region && (
+        <span className="opacity-70"> (region {health.region})</span>
+      )}
+    </Banner>
   );
 }
 

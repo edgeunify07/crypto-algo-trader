@@ -9,6 +9,39 @@ import { KEYS, kv } from "@/lib/store/kv";
 import type { FuturesPosition, FuturesTrade } from "@/lib/store/account";
 
 /**
+ * The currently-forming bar, straight from the exchange.
+ *
+ * `getCandles` deliberately returns closed bars only, because every indicator
+ * in the engine would repaint if fed a partial one. The chart wants it anyway,
+ * so it is fetched separately and never passed to analysis.
+ */
+async function fetchFuturesKlinesRaw(
+  symbol: string,
+  interval: Timeframe,
+): Promise<{ t: number; o: number; h: number; l: number; c: number; v: number } | null> {
+  const hosts = (
+    process.env.BINANCE_FUTURES_HOSTS ?? "https://www.binance.com,https://fapi.binance.com"
+  ).split(",").map((h) => h.trim()).filter(Boolean);
+
+  for (const host of hosts) {
+    try {
+      const res = await fetch(
+        `${host}/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=1`,
+        { cache: "no-store", signal: AbortSignal.timeout(6000) },
+      );
+      if (!res.ok) continue;
+      const raw = (await res.json()) as [number, string, string, string, string, string, number][];
+      const k = raw[0];
+      if (!k) continue;
+      return { t: k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5] };
+    } catch {
+      // Try the next host.
+    }
+  }
+  return null;
+}
+
+/**
  * Chart data for one symbol: candles, indicator series, the Elliott/Gann read,
  * and every marker the UI needs to show what the engine did and why.
  *
@@ -26,6 +59,10 @@ export async function GET(request: Request) {
   const tfParam = url.searchParams.get("timeframe") ?? "1h";
   const timeframe: Timeframe = isTimeframe(tfParam) ? tfParam : "1h";
   const limit = Math.min(300, Number(url.searchParams.get("limit") ?? "150") || 150);
+  // The in-progress bar is excluded from analysis — indicators must never
+  // read a partial candle — but the chart should still show price moving
+  // inside it, so it is appended only after every series is computed.
+  const wantLive = url.searchParams.get("live") === "1";
 
   try {
     const [candles, stored, positions, trades] = await Promise.all([
@@ -68,13 +105,27 @@ export async function GET(request: Request) {
     const position = (positions ?? []).find((p) => p.symbol === symbol) ?? null;
     const firstTime = (tail(candles)[0]?.openTime) ?? 0;
 
+    let live: { t: number; o: number; h: number; l: number; c: number; v: number } | null = null;
+    if (wantLive) {
+      try {
+        const fresh = await fetchFuturesKlinesRaw(symbol, timeframe);
+        if (fresh) live = fresh;
+      } catch {
+        // A missing live bar just means the chart ends at the last close.
+      }
+    }
+
     return NextResponse.json(
       {
         symbol,
         timeframe,
-        candles: tail(candles).map((c) => ({
-          t: c.openTime, o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume,
-        })),
+        candles: [
+          ...tail(candles).map((c) => ({
+            t: c.openTime, o: c.open, h: c.high, l: c.low, c: c.close, v: c.volume,
+          })),
+          ...(live && live.t > (tail(candles).at(-1)?.openTime ?? 0) ? [live] : []),
+        ],
+        liveBar: live !== null,
         indicators: {
           emaFast: clean(emaFast),
           emaSlow: clean(emaSlow),
