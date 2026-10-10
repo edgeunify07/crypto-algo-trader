@@ -1,5 +1,3 @@
-import Anthropic from "@anthropic-ai/sdk";
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
 import { z } from "zod";
 import { config } from "../config.js";
 import { createLogger } from "../util/logger.js";
@@ -9,16 +7,27 @@ import {
   sanitiseParams,
   type StrategyParams,
 } from "../strategy/params.js";
+import {
+  LlmRequestError,
+  LlmUnavailableError,
+  describeIssues,
+  extractJson,
+  type LlmProvider,
+} from "./llmProvider.js";
+import { OpenRouterProvider } from "./providers/openrouter.js";
+import { AnthropicProvider } from "./providers/anthropic.js";
 
 const log = createLogger("llm");
 
+export { LlmUnavailableError };
+
 /**
- * Structured-output schema for parameter proposals.
+ * Response schema for parameter proposals.
  *
- * `timeframeWeights` is spelled out key-by-key rather than as a record: a
- * JSON-Schema `additionalProperties` map is awkward for strict structured
- * output, and an explicit shape also stops the model inventing timeframes the
- * engine doesn't trade.
+ * `timeframeWeights` is spelled out key-by-key rather than as a record: an
+ * `additionalProperties` map is awkward for strict structured output and is
+ * the first thing weaker models get wrong, and an explicit shape also stops a
+ * model inventing timeframes the engine doesn't trade.
  */
 const TimeframeWeightsSchema = z.object(
   Object.fromEntries(
@@ -60,6 +69,16 @@ const ProposalSchema = z.object({
 export type Proposal = z.infer<typeof ProposalSchema>;
 export type ProposalCandidate = Proposal["candidates"][number];
 
+/** Cached because Zod regenerates the schema object on every call. */
+let cachedJsonSchema: Record<string, unknown> | null = null;
+function proposalJsonSchema(): Record<string, unknown> {
+  cachedJsonSchema ??= z.toJSONSchema(ProposalSchema, {
+    io: "input",
+    target: "draft-7",
+  }) as Record<string, unknown>;
+  return cachedJsonSchema;
+}
+
 const SYSTEM_PROMPT = `You are a quantitative trading researcher tuning a multi-timeframe crypto strategy.
 
 The strategy blends nine analysis components (EMA trend, MACD, RSI, ADX, Bollinger, volume/OBV, market structure, Elliott Wave, Gann) across up to thirteen Binance timeframes. Each component emits a score in [-1, +1]; component weights and timeframe weights decide the blend. A trade plan is produced only when the blended score, confidence and cross-timeframe alignment all clear their thresholds. Stops are ATR-based and snapped to structural levels; targets are an R-multiple ladder optionally snapped to Elliott/Gann levels.
@@ -73,7 +92,10 @@ Rules you must follow:
 - Respect every schema bound. Keep emaFast < emaSlow and macdFast < macdSlow. takeProfitRMultiples must ascend and takeProfitFractions must sum to <= 1 with the same length.
 - Do not chase the reported return. A candidate that lifts return by widening risk is not an improvement; the selection score weights Sharpe, Calmar, expectancy and drawdown, and candidates are re-tested out of sample.
 - Be suspicious of small samples. If the report shows few trades, prefer loosening entry thresholds to collect evidence over fine-tuning exits on noise.
-- riskPerTrade above 0.02 is almost never justified. Account-level limits are enforced outside your control, so raising risk here mostly just raises drawdown.`;
+- riskPerTrade above 0.02 is almost never justified. Account-level limits are enforced outside your control, so raising risk here mostly just raises drawdown.
+
+OUTPUT FORMAT — this is critical:
+Reply with a single JSON object and nothing else. No markdown fences, no commentary before or after, no explanation outside the JSON. Every field in the schema is required, including the complete "params" object for every candidate with all of its nested sections (weights, indicators, timeframeWeights, entry, exit, risk). "timeframeWeights" must contain exactly these keys: ${TIMEFRAMES.join(", ")}.`;
 
 function buildUserPrompt(
   report: string,
@@ -90,24 +112,45 @@ ${history ? `\n=== RECENT ATTEMPTS (do not repeat these) ===\n${history}\n` : ""
 Propose exactly ${candidateCount} candidate parameter sets that test distinct hypotheses about what is limiting performance.
 
 The incumbent parameters you are modifying are:
-${JSON.stringify(incumbent, null, 2)}`;
+${JSON.stringify(incumbent, null, 2)}
+
+Return one JSON object matching the required schema, with a "candidates" array of exactly ${candidateCount} entries.`;
 }
 
-export class LlmUnavailableError extends Error {}
+/** Build the configured provider. */
+export function createProvider(): LlmProvider {
+  const choice = config.llm.provider;
+  const hasOpenRouter = config.llm.openrouter.apiKey !== "";
+  const hasAnthropic = config.llm.anthropic.apiKey !== "";
+
+  if (choice === "openrouter") return new OpenRouterProvider();
+  if (choice === "anthropic") return new AnthropicProvider();
+
+  // auto
+  if (hasOpenRouter) return new OpenRouterProvider();
+  if (hasAnthropic) return new AnthropicProvider();
+
+  throw new LlmUnavailableError(
+    "No LLM credentials found. Set OPENROUTER_API_KEY (or ANTHROPIC_API_KEY), " +
+      "or run with --no-llm to use local mutation search instead.",
+  );
+}
 
 /**
- * Ask Claude for parameter proposals.
+ * Ask the configured model for parameter proposals.
  *
- * Uses structured output so the response is guaranteed to match the strategy's
- * own schema — the model cannot return a params object the engine can't run.
- * Everything it returns is still sanitised and bounds-checked before use.
+ * The response is extracted, validated against the strategy's own Zod schema,
+ * and — when a model gets the shape wrong — sent back with its specific
+ * validation errors for repair. Weaker and cheaper models get the shape wrong
+ * often enough that this repair step is what makes them usable at all.
  */
 export async function proposeParameters(options: {
   report: string;
   incumbent: StrategyParams;
   history?: string;
   candidateCount?: number;
-}): Promise<Proposal> {
+  provider?: LlmProvider;
+}): Promise<Proposal & { servedBy: string }> {
   const {
     report,
     incumbent,
@@ -115,51 +158,59 @@ export async function proposeParameters(options: {
     candidateCount = config.llm.candidatesPerRound,
   } = options;
 
-  if (!config.llm.apiKey) {
-    throw new LlmUnavailableError(
-      "ANTHROPIC_API_KEY is not set — run with --no-llm to use local mutation search instead.",
-    );
-  }
-
-  const client = new Anthropic({ apiKey: config.llm.apiKey });
+  const provider = options.provider ?? createProvider();
+  const jsonSchema = proposalJsonSchema();
+  const system = SYSTEM_PROMPT;
+  let user = buildUserPrompt(report, incumbent, history, candidateCount);
 
   log.info(
-    `asking ${config.llm.model} for ${candidateCount} candidate parameter sets`,
+    `asking ${provider.name} [${provider.models.join(" -> ")}] for ${candidateCount} candidates`,
   );
 
-  const response = await client.messages.parse({
-    model: config.llm.model,
-    max_tokens: config.llm.maxTokens,
-    system: SYSTEM_PROMPT,
-    output_config: {
-      effort: config.llm.effort as "low" | "medium" | "high" | "xhigh" | "max",
-      format: zodOutputFormat(ProposalSchema),
-    },
-    messages: [
-      {
-        role: "user",
-        content: buildUserPrompt(report, incumbent, history, candidateCount),
-      },
-    ],
-  });
+  let lastError: string | null = null;
 
-  if (response.stop_reason === "refusal") {
-    throw new Error(
-      `model declined the request: ${response.stop_details?.explanation ?? "no explanation given"}`,
+  for (let attempt = 0; attempt <= config.llm.repairAttempts; attempt++) {
+    const completion = await provider.complete({
+      system,
+      user,
+      jsonSchema,
+      schemaName: "strategy_parameter_proposal",
+      maxTokens: config.llm.maxTokens,
+    });
+
+    const cost =
+      completion.usage.costUsd === null
+        ? ""
+        : `, $${completion.usage.costUsd.toFixed(5)}`;
+    log.info(
+      `served by ${completion.model} (${completion.usage.inputTokens} in / ${completion.usage.outputTokens} out${cost})`,
     );
+
+    try {
+      const raw = extractJson(completion.text);
+      const parsed = ProposalSchema.safeParse(raw);
+      if (parsed.success) {
+        return { ...parsed.data, servedBy: completion.model };
+      }
+      lastError = describeIssues(parsed.error);
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+
+    if (attempt === config.llm.repairAttempts) break;
+
+    log.warn(
+      `response failed validation (attempt ${attempt + 1}/${config.llm.repairAttempts + 1}); asking for a correction`,
+    );
+    user =
+      `${buildUserPrompt(report, incumbent, history, candidateCount)}\n\n` +
+      `IMPORTANT — your previous reply was rejected. Fix exactly these problems and return ONLY the corrected JSON object:\n${lastError}\n\n` +
+      `Do not apologise or explain. Output the JSON object alone.`;
   }
 
-  const parsed = response.parsed_output;
-  if (!parsed) {
-    throw new Error("model returned no parseable proposal");
-  }
-
-  const usage = response.usage;
-  log.info(
-    `received ${parsed.candidates.length} candidates (${usage.input_tokens} in / ${usage.output_tokens} out tokens)`,
+  throw new LlmRequestError(
+    `model did not return a valid proposal after ${config.llm.repairAttempts + 1} attempts: ${lastError}`,
   );
-
-  return parsed;
 }
 
 /** Validate and repair a proposed params object before it is backtested. */

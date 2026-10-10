@@ -1,56 +1,60 @@
 @import "tailwindcss";
 
-/* Binance-style dark trading terminal palette */
 :root {
-  --bg: #0b0e11;
-  --panel: #181a20;
-  --panel-2: #1e2329;
-  --hover: #2b3139;
-  --border: #2b3139;
-  --text: #eaecef;
-  --muted: #848e9c;
-  --accent: #fcd535;
-  --up: #2ebd85;
-  --down: #f6465d;
+  --bg: #0a0d13;
+  --surface: #121722;
+  --surface-2: #1a2130;
+  --line: #232c3d;
+  --text: #e8eef9;
+  --muted: #8a99b3;
+  --up: #22c98b;
+  --down: #ff5570;
+  --accent: #5aa9ff;
+  --warn: #f5b942;
 }
 
-@theme inline {
-  --color-bg: var(--bg);
-  --color-panel: var(--panel);
-  --color-panel2: var(--panel-2);
-  --color-hover: var(--hover);
-  --color-line: var(--border);
-  --color-text: var(--text);
-  --color-muted: var(--muted);
-  --color-accent: var(--accent);
-  --color-up: var(--up);
-  --color-down: var(--down);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+* {
+  -webkit-tap-highlight-color: transparent;
 }
 
 html,
 body {
   background: var(--bg);
   color: var(--text);
-  font-family: var(--font-geist-sans), -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  font-family: ui-rounded, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    system-ui, sans-serif;
+  /* Stop iOS rubber-band scrolling revealing white behind the app. */
+  overscroll-behavior-y: none;
 }
 
-/* Tabular figures for all numeric data, Binance-style */
-.nums {
+body {
+  /* Safe-area padding so content clears the notch and the home indicator. */
+  padding-top: env(safe-area-inset-top);
+  padding-bottom: env(safe-area-inset-bottom);
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+.tnum {
   font-variant-numeric: tabular-nums;
   font-feature-settings: "tnum";
 }
 
-/* Thin scrollbars inside terminal panels */
-.scroll-thin::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+/* Hide scrollbars on the horizontal strips without disabling scrolling. */
+.no-bar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
 }
-.scroll-thin::-webkit-scrollbar-thumb {
-  background: #2b3139;
-  border-radius: 3px;
+.no-bar::-webkit-scrollbar {
+  display: none;
 }
-.scroll-thin::-webkit-scrollbar-track {
-  background: transparent;
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+.live-dot {
+  animation: pulse-dot 2s ease-in-out infinite;
 }

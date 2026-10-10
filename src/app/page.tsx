@@ -1,246 +1,612 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { CandleInterval, Ticker } from "@/lib/types";
-import { useStreamTarget, useMarketSub, type WsTicker } from "@/lib/useMarketStream";
-import ChartPanel, { type ChartMarker } from "@/components/ChartPanel";
-import OrderBook from "@/components/OrderBook";
-import TradesFeed from "@/components/TradesFeed";
-import MarketList from "@/components/MarketList";
-import TradePanel, { type StrategyMeta } from "@/components/TradePanel";
-import BottomTabs from "@/components/BottomTabs";
 
-const fmt = (n: number, d = 2) => new Intl.NumberFormat("en-US", { minimumFractionDigits: d, maximumFractionDigits: d }).format(n);
+/**
+ * Automated futures trading dashboard.
+ *
+ * There is no start/stop control by design. On serverless there is no process
+ * to start — the loop advances one step per request to `/api/v2/tick`, driven
+ * by this page while it is open and by an external scheduler when it is not.
+ * A "Start Bot" button would imply a background process that cannot exist.
+ */
 
-interface FullStatus {
-  running: boolean;
-  positions: { symbol: string; qty: number; entryPrice: number; entryTime?: number }[];
-  events: { time: number; symbol: string; action: string; price: number; qty?: number; pnl?: number; reason?: string; mode: string; live: boolean; clientOrderId?: string }[];
-  risk: { killSwitch: boolean; realizedPnlToday: number; currentEquity?: number; limits: { maxOrderNotionalUSDT: number; maxDailyLossUSDT: number; maxOpenPositions: number } };
-  server?: { env: string; live: boolean; hasKeys: boolean; tradingEnabled: boolean };
-  lastSignal?: string | null;
-  pendingSignal?: string | null;
-  pendingReason?: string;
-  lastEvent?: FullStatus["events"][0] | null;
-  lastError?: string | null;
-  config?: { symbol?: string; interval?: string; mode?: string; tradeNotionalUSDT?: number; strategyId?: string } | null;
+type Direction = "long" | "short" | "flat";
+
+interface TfRead {
+  score: number;
+  confidence: number;
+  direction: string;
+  regime: string;
+  elliott: { pattern: string; wave: string; bias: string; confidence: number };
+  gann: { bias: string; confidence: number; barsSinceAnchor: number; nearestCycle: number };
 }
 
-export default function Terminal() {
-  const [symbol, setSymbol] = useState("BTCUSDT");
-  const [interval, setInterval] = useState<CandleInterval>("15m");
-  const [ticker, setTicker] = useState<Ticker | null>(null);
-  const [strategies, setStrategies] = useState<StrategyMeta[]>([]);
-  const [strategyId, setStrategyId] = useState("");
-  const [params, setParams] = useState<Record<string, number>>({});
-  const [mode, setMode] = useState<"paper" | "live">("paper");
-  const [tradeNotional, setTradeNotional] = useState(25);
-  const [status, setStatus] = useState<FullStatus | null>(null);
-  const [chartMarkers, setChartMarkers] = useState<ChartMarker[]>([]);
-  const [backtestMarkers, setBacktestMarkers] = useState<ChartMarker[]>([]);
-  const [bottomH, setBottomH] = useState(320);
-  const dragRef = useRef<{ startY: number; startH: number } | null>(null);
+interface ScreenerRow {
+  symbol: string;
+  markPrice: number;
+  score: number;
+  confidence: number;
+  alignment: number;
+  direction: Direction;
+  anchorTimeframe: string;
+  style: string;
+  quoteVolume24h: number;
+  fundingRate: number;
+  hasPosition: boolean;
+  timeframes: Record<string, TfRead>;
+}
 
-  useEffect(() => {
-    fetch("/api/backtest").then((r) => r.json()).then((j) => {
-      setStrategies(j.strategies ?? []);
-      if (j.strategies?.[0]) { setStrategyId(j.strategies[0].id); setParams({ ...j.strategies[0].params }); }
-    }).catch(() => {});
-  }, []);
+interface Position {
+  id: string;
+  symbol: string;
+  side: "long" | "short";
+  quantity: number;
+  entryPrice: number;
+  markPrice: number;
+  margin: number;
+  leverage: number;
+  stopLoss: number;
+  liquidationPrice: number;
+  unrealised: number;
+  unrealisedPct: number;
+  distanceToLiquidation: number;
+  notional: number;
+  style: string;
+  timeframe: string;
+  fundingPaid: number;
+  openedAt: number;
+  reasons: string[];
+}
 
-  const eventsToMarkers = useCallback((events: FullStatus["events"], sym: string): ChartMarker[] => {
-    return events
-      .filter((e) => (e.action === "BUY" || e.action === "SELL") && e.symbol.toUpperCase() === sym.toUpperCase() && e.price > 0)
-      .map((e) => ({
-        time: e.time,
-        price: e.price,
-        side: e.action === "BUY" ? "buy" as const : "sell" as const,
-        reason: e.reason ?? (e.live ? "live" : e.mode),
-      }));
-  }, []);
+interface Trade {
+  id: string;
+  symbol: string;
+  side: "long" | "short";
+  style: string;
+  timeframe: string;
+  entryPrice: number;
+  exitPrice: number;
+  grossPnl: number;
+  entryFee: number;
+  exitFee: number;
+  fundingCost: number;
+  netPnl: number;
+  netPnlPct: number;
+  rMultiple: number;
+  exitReason: string;
+  closedAt: number;
+}
 
-  useEffect(() => {
-    fetch(`/api/journal?format=json&symbol=${symbol}&limit=100`)
-      .then((r) => r.json())
-      .then((j) => {
-        const persisted = eventsToMarkers(j.events ?? [], symbol);
-        const bot = status?.events ? eventsToMarkers(status.events, symbol) : [];
-        const byKey = new Map<string, ChartMarker>();
-        for (const m of [...persisted, ...bot, ...backtestMarkers]) {
-          byKey.set(`${m.time}-${m.side}-${m.reason ?? ""}`, m);
-        }
-        setChartMarkers([...byKey.values()].sort((a, b) => a.time - b.time));
-      })
-      .catch(() => {
-        const bot = status?.events ? eventsToMarkers(status.events, symbol) : [];
-        setChartMarkers([...bot, ...backtestMarkers].sort((a, b) => a.time - b.time));
-      });
-  }, [symbol, status?.events, backtestMarkers, eventsToMarkers]);
+interface State {
+  durable: boolean;
+  account: {
+    balance: number;
+    startingBalance: number;
+    equity: number;
+    unrealised: number;
+    realisedPnl: number;
+    totalFees: number;
+    totalFunding: number;
+    drawdown: number;
+    returnPct: number;
+    leverage: number;
+    tickCount: number;
+    lastTickAt: number;
+    haltedReason: string | null;
+  };
+  positions: Position[];
+  stats: {
+    trades: number;
+    wins: number;
+    losses: number;
+    winRate: number;
+    netPnl: number;
+    grossPnl: number;
+    fees: number;
+    funding: number;
+  };
+  params: { version: string; source: string };
+}
 
-  useStreamTarget(symbol, interval);
+const TF_ORDER = ["5m", "15m", "1h", "4h", "1d"];
+const TICK_MS = 20_000;
 
-  useMarketSub<WsTicker>("ticker", (d) => {
-    setTicker({
-      market: symbol,
-      lastPrice: Number(d.c),
-      bid: Number(d.b ?? d.c),
-      ask: Number(d.a ?? d.c),
-      high24h: Number(d.h),
-      low24h: Number(d.l),
-      volume: Number(d.v),
-      change24h: Number(d.P),
-      timestamp: Date.now(),
-    });
-  });
+const money = (n: number, d = 2) =>
+  `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(d)}`;
+const signed = (n: number, d = 2) => `${n >= 0 ? "+" : "-"}$${Math.abs(n).toFixed(d)}`;
+const pct = (n: number, d = 1) => `${(n * 100).toFixed(d)}%`;
+const tone = (n: number) =>
+  n > 0 ? "text-[var(--up)]" : n < 0 ? "text-[var(--down)]" : "text-[var(--muted)]";
 
-  useEffect(() => { setTicker(null); }, [symbol]);
+function timeAgo(t: number): string {
+  if (!t) return "never";
+  const s = Math.max(0, Math.floor((Date.now() - t) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
 
-  const refreshStatus = useCallback(async () => {
+function fmtPrice(n: number): string {
+  if (!Number.isFinite(n) || n === 0) return "—";
+  if (n >= 1000) return n.toFixed(2);
+  if (n >= 1) return n.toFixed(4);
+  return n.toFixed(6);
+}
+
+export default function Home() {
+  const [state, setState] = useState<State | null>(null);
+  const [rows, setRows] = useState<ScreenerRow[]>([]);
+  const [trades, setTrades] = useState<Trade[]>([]);
+  const [tab, setTab] = useState<"live" | "scan" | "history">("live");
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [ticking, setTicking] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastTick, setLastTick] = useState<number>(0);
+  const inFlight = useRef(false);
+
+  const refresh = useCallback(async () => {
     try {
-      const r = await fetch("/api/bot", { cache: "no-store" });
-      const j = await r.json();
-      if (r.ok) setStatus(j);
-    } catch { /* ignore */ }
+      const [s, sc, tr] = await Promise.all([
+        fetch("/api/v2/state", { cache: "no-store" }).then((r) => r.json()),
+        fetch("/api/v2/screener", { cache: "no-store" }).then((r) => r.json()),
+        fetch("/api/v2/trades?limit=50", { cache: "no-store" }).then((r) => r.json()),
+      ]);
+      if (s?.account) setState(s);
+      if (Array.isArray(sc?.rows)) setRows(sc.rows);
+      if (Array.isArray(tr?.trades)) setTrades(tr.trades);
+      setError(null);
+    } catch {
+      setError("Cannot reach the server");
+    }
   }, []);
 
+  /** Drive the loop. Guarded so a slow tick never overlaps itself. */
+  const tick = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setTicking(true);
+    try {
+      const res = await fetch("/api/v2/tick", { method: "POST", cache: "no-store" });
+      const body = await res.json();
+      if (body?.error) setError(body.error);
+      else if (body?.ok || body?.skipped) {
+        setLastTick(Date.now());
+        setError(null);
+      }
+      await refresh();
+    } catch {
+      setError("Tick failed");
+    } finally {
+      inFlight.current = false;
+      setTicking(false);
+    }
+  }, [refresh]);
+
   useEffect(() => {
-    refreshStatus();
-    const ms = status?.running ? 1000 : 2500;
-    const id = window.setInterval(refreshStatus, ms);
-    return () => window.clearInterval(id);
-  }, [refreshStatus, status?.running]);
-
-  const onResizeStart = (e: React.MouseEvent) => {
-    e.preventDefault();
-    dragRef.current = { startY: e.clientY, startH: bottomH };
-    const onMove = (ev: MouseEvent) => {
-      if (!dragRef.current) return;
-      const delta = dragRef.current.startY - ev.clientY;
-      const next = Math.min(Math.max(dragRef.current.startH + delta, 160), Math.floor(window.innerHeight * 0.75));
-      setBottomH(next);
+    // Deferred by a timer rather than called inline: an inline call updates
+    // state during the effect's synchronous phase, and in StrictMode it would
+    // also fire two ticks on mount.
+    const kick = setTimeout(() => {
+      void refresh();
+      void tick();
+    }, 0);
+    const t = setInterval(() => void tick(), TICK_MS);
+    const r = setInterval(() => void refresh(), 7000);
+    // Catch up immediately when the app comes back to the foreground on iOS.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void tick();
     };
-    const onUp = () => {
-      dragRef.current = null;
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      clearTimeout(kick);
+      clearInterval(t);
+      clearInterval(r);
+      document.removeEventListener("visibilitychange", onVisible);
     };
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-  };
+  }, [tick, refresh]);
 
-  const applyStrategy = (id: string) => {
-    setStrategyId(id);
-    const s = strategies.find((x) => x.id === id);
-    if (s) setParams({ ...s.params });
-    if (id === "confluence-scalp") setInterval("1m");
-    else if (id === "confluence-swing" && interval === "1m") setInterval("15m");
-  };
-
-  const up = (ticker?.change24h ?? 0) >= 0;
-  const armed = status?.server?.live;
-  const botStrategyMismatch = status?.running && status.config?.strategyId && status.config.strategyId !== strategyId;
+  const acct = state?.account;
+  const equity = acct?.equity ?? 0;
+  const totalPnl = equity - (acct?.startingBalance ?? 100);
 
   return (
-    <div className="flex h-screen flex-col bg-bg text-text">
-      <header className="flex flex-wrap items-center gap-x-6 gap-y-1 border-b border-line px-4 py-2">
-        <div className="flex items-center gap-2">
-          <span className="text-base font-bold text-accent">◆ UNIFY</span>
-          <span className="text-sm font-semibold text-text">{symbol.replace("USDT", "")}<span className="text-muted">/USDT</span></span>
-        </div>
-        <div className="nums flex items-baseline gap-1">
-          <span className={`text-lg font-semibold ${up ? "text-up" : "text-down"}`}>{ticker ? fmt(ticker.lastPrice) : "—"}</span>
-        </div>
-        <Stat label="24h Change" value={ticker ? `${up ? "+" : ""}${ticker.change24h.toFixed(2)}%` : "—"} cls={up ? "text-up" : "text-down"} />
-        <Stat label="24h High" value={ticker ? fmt(ticker.high24h) : "—"} />
-        <Stat label="24h Low" value={ticker ? fmt(ticker.low24h) : "—"} />
-        <Stat label="24h Volume" value={ticker ? `${fmt(ticker.volume, 0)}` : "—"} />
-        <div className="ml-auto flex items-center gap-3 text-xs">
-          {status?.running && <span className="flex items-center gap-1 text-up"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-up" />BOT RUNNING</span>}
-          {botStrategyMismatch && (
-            <span className="rounded bg-accent/20 px-2 py-0.5 text-[10px] text-accent">
-              UI: {strategyId} · bot: {status?.config?.strategyId} — restart bot to apply
+    <main className="min-h-screen pb-24">
+      {/* ---- Equity header ---- */}
+      <header className="sticky top-0 z-20 bg-[var(--bg)]/95 backdrop-blur border-b border-[var(--line)] px-4 pt-3 pb-3">
+        <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] uppercase tracking-wider text-[var(--muted)]">
+              Equity
             </span>
-          )}
-          <span className={`rounded px-2 py-0.5 ${armed ? "bg-down/20 text-down" : "bg-panel2 text-muted"}`}>
-            {armed ? `LIVE · ${status?.server?.env}` : `SAFE · ${status?.server?.env ?? "testnet"}`}
-          </span>
-          <button
-            onClick={async () => { await fetch("/api/auth/logout", { method: "POST" }); window.location.href = "/login"; }}
-            className="rounded border border-line px-2 py-0.5 text-muted hover:text-text"
-          >
-            Logout
-          </button>
-        </div>
-      </header>
-
-      <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-56 shrink-0 border-r border-line bg-panel lg:block">
-          <MarketList selected={symbol} onSelect={setSymbol} />
-        </aside>
-
-        <section className="flex min-w-0 flex-1 flex-col">
-          <div className="min-h-0 flex-1 bg-panel">
-            <ChartPanel symbol={symbol} interval={interval} onInterval={setInterval} params={params} tradeMarkers={chartMarkers} />
-          </div>
-          <div
-            role="separator"
-            aria-orientation="horizontal"
-            aria-label="Resize bottom panel"
-            onMouseDown={onResizeStart}
-            className="group flex h-2 shrink-0 cursor-row-resize items-center justify-center border-t border-line bg-panel2 hover:bg-accent/30"
-            title="Drag to resize"
-          >
-            <div className="h-0.5 w-10 rounded bg-muted group-hover:bg-accent" />
-          </div>
-          <div style={{ height: bottomH }} className="shrink-0 overflow-hidden bg-panel">
-            <BottomTabs
-              symbol={symbol}
-              interval={interval}
-              strategyId={strategyId}
-              params={params}
-              status={status}
-              onChartMarkers={setBacktestMarkers}
-              onUseStrategy={applyStrategy}
+            <span
+              className={`live-dot h-1.5 w-1.5 rounded-full ${
+                ticking ? "bg-[var(--accent)]" : "bg-[var(--up)]"
+              }`}
             />
           </div>
-        </section>
+          <span className="text-[10px] text-[var(--muted)] tnum">
+            {acct?.leverage ?? 3}x · tick {acct?.tickCount ?? 0} ·{" "}
+            {timeAgo(lastTick || (acct?.lastTickAt ?? 0))}
+          </span>
+        </div>
 
-        <aside className="hidden w-64 shrink-0 border-l border-line bg-panel md:flex md:flex-col">
-          <div className="min-h-0 flex-1 overflow-hidden border-b border-line">
-            <OrderBook symbol={symbol} lastPrice={ticker?.lastPrice ?? 0} />
-          </div>
-          <div className="h-[40%] min-h-0">
-            <TradesFeed symbol={symbol} />
-          </div>
-        </aside>
+        <div className="flex items-baseline gap-3">
+          <span className="text-[34px] leading-none font-semibold tnum">
+            {money(equity)}
+          </span>
+          <span className={`text-sm font-medium tnum ${tone(totalPnl)}`}>
+            {signed(totalPnl)} ({pct(acct?.returnPct ?? 0, 2)})
+          </span>
+        </div>
 
-        <aside className="hidden w-72 shrink-0 border-l border-line bg-panel xl:block">
-          <TradePanel
-            symbol={symbol}
-            interval={interval}
-            strategies={strategies}
-            strategyId={strategyId}
-            onStrategy={applyStrategy}
-            params={params}
-            onParams={setParams}
-            mode={mode}
-            onMode={setMode}
-            tradeNotional={tradeNotional}
-            onTradeNotional={setTradeNotional}
-            status={status}
-            onChanged={refreshStatus}
+        <div className="mt-2 grid grid-cols-4 gap-2 text-[10px]">
+          <Stat label="Free" value={money(acct?.balance ?? 0)} />
+          <Stat
+            label="Unreal."
+            value={signed(acct?.unrealised ?? 0)}
+            cls={tone(acct?.unrealised ?? 0)}
           />
-        </aside>
+          <Stat label="Fees" value={money(acct?.totalFees ?? 0, 3)} cls="text-[var(--warn)]" />
+          <Stat label="Draw" value={pct(acct?.drawdown ?? 0)} />
+        </div>
+
+        {state && !state.durable && (
+          <Banner tone="warn">
+            Storage is not configured — state resets. Add Upstash Redis env vars.
+          </Banner>
+        )}
+        {acct?.haltedReason && (
+          <Banner tone="down">Entries halted: {acct.haltedReason}</Banner>
+        )}
+        {error && <Banner tone="down">{error}</Banner>}
+      </header>
+
+      {/* ---- Tabs ---- */}
+      <nav className="flex gap-1 px-4 py-3">
+        {(["live", "scan", "history"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`flex-1 rounded-lg py-2 text-[12px] font-medium capitalize transition-colors ${
+              tab === t
+                ? "bg-[var(--surface-2)] text-[var(--text)]"
+                : "text-[var(--muted)]"
+            }`}
+          >
+            {t === "live"
+              ? `Positions ${state?.positions.length ? `(${state.positions.length})` : ""}`
+              : t === "scan"
+                ? "Signals"
+                : `Trades ${state?.stats.trades ? `(${state.stats.trades})` : ""}`}
+          </button>
+        ))}
+      </nav>
+
+      <div className="px-4 space-y-2">
+        {tab === "live" && <LiveTab positions={state?.positions ?? []} />}
+        {tab === "scan" && (
+          <ScanTab rows={rows} expanded={expanded} setExpanded={setExpanded} />
+        )}
+        {tab === "history" && <HistoryTab trades={trades} stats={state?.stats} />}
       </div>
-    </div>
+
+      <footer className="fixed bottom-0 inset-x-0 bg-[var(--bg)]/95 backdrop-blur border-t border-[var(--line)] px-4 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
+        <div className="flex items-center justify-between text-[10px] text-[var(--muted)]">
+          <span>Paper · USDⓈ-M perps · fees &amp; funding real</span>
+          <span className="tnum">{state?.params.version ?? "—"}</span>
+        </div>
+      </footer>
+    </main>
   );
 }
 
 function Stat({ label, value, cls }: { label: string; value: string; cls?: string }) {
   return (
-    <div className="hidden flex-col sm:flex">
-      <span className="text-[10px] text-muted">{label}</span>
-      <span className={`nums text-xs ${cls ?? "text-text"}`}>{value}</span>
+    <div className="rounded-lg bg-[var(--surface)] px-2 py-1.5">
+      <div className="text-[9px] uppercase tracking-wide text-[var(--muted)]">{label}</div>
+      <div className={`tnum text-[12px] font-medium ${cls ?? ""}`}>{value}</div>
     </div>
+  );
+}
+
+function Banner({ tone, children }: { tone: "warn" | "down"; children: React.ReactNode }) {
+  const colour = tone === "warn" ? "var(--warn)" : "var(--down)";
+  return (
+    <div
+      className="mt-2 rounded-lg px-2.5 py-1.5 text-[11px]"
+      style={{ background: `${colour}1a`, color: colour }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Empty({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="rounded-xl bg-[var(--surface)] py-10 text-center text-[12px] text-[var(--muted)]">
+      {children}
+    </div>
+  );
+}
+
+function LiveTab({ positions }: { positions: Position[] }) {
+  if (positions.length === 0) {
+    return <Empty>No open positions — the engine is waiting for a qualified setup.</Empty>;
+  }
+  return (
+    <>
+      {positions.map((p) => {
+        const long = p.side === "long";
+        const liqNear = p.distanceToLiquidation < 0.1;
+        return (
+          <div key={p.id} className="rounded-xl bg-[var(--surface)] p-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="font-semibold text-[15px]">
+                  {p.symbol.replace("USDT", "")}
+                </span>
+                <span
+                  className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                    long
+                      ? "bg-[var(--up)]/15 text-[var(--up)]"
+                      : "bg-[var(--down)]/15 text-[var(--down)]"
+                  }`}
+                >
+                  {p.side.toUpperCase()} {p.leverage}x
+                </span>
+                <span className="rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                  {p.style} · {p.timeframe}
+                </span>
+              </div>
+              <div className="text-right">
+                <div className={`tnum text-[15px] font-semibold ${tone(p.unrealised)}`}>
+                  {signed(p.unrealised, 3)}
+                </div>
+                <div className={`tnum text-[10px] ${tone(p.unrealised)}`}>
+                  {pct(p.unrealisedPct)} on margin
+                </div>
+              </div>
+            </div>
+
+            <div className="mt-2.5 grid grid-cols-4 gap-2 text-[10px]">
+              <Cell label="Entry" value={fmtPrice(p.entryPrice)} />
+              <Cell label="Mark" value={fmtPrice(p.markPrice)} />
+              <Cell label="Stop" value={fmtPrice(p.stopLoss)} />
+              <Cell
+                label="Liq"
+                value={fmtPrice(p.liquidationPrice)}
+                cls={liqNear ? "text-[var(--down)]" : ""}
+              />
+            </div>
+
+            <div className="mt-2 flex items-center justify-between text-[10px] text-[var(--muted)]">
+              <span className="tnum">
+                {p.quantity} · {money(p.notional)} notional · {money(p.margin)} margin
+              </span>
+              <span className={`tnum ${p.fundingPaid < 0 ? "text-[var(--warn)]" : ""}`}>
+                funding {signed(p.fundingPaid, 4)}
+              </span>
+            </div>
+
+            <details className="mt-2">
+              <summary className="cursor-pointer list-none text-[10px] text-[var(--accent)]">
+                Why this trade
+              </summary>
+              <ul className="mt-1.5 space-y-0.5">
+                {p.reasons.map((r, i) => (
+                  <li key={i} className="text-[10px] leading-relaxed text-[var(--muted)]">
+                    · {r}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+function Cell({ label, value, cls }: { label: string; value: string; cls?: string }) {
+  return (
+    <div className="rounded-lg bg-[var(--surface-2)] px-2 py-1.5">
+      <div className="text-[9px] uppercase tracking-wide text-[var(--muted)]">{label}</div>
+      <div className={`tnum text-[11px] ${cls ?? ""}`}>{value}</div>
+    </div>
+  );
+}
+
+function ScanTab({
+  rows,
+  expanded,
+  setExpanded,
+}: {
+  rows: ScreenerRow[];
+  expanded: string | null;
+  setExpanded: (s: string | null) => void;
+}) {
+  if (rows.length === 0) {
+    return <Empty>Waiting for the first scan of today&apos;s top-10 by volume…</Empty>;
+  }
+  return (
+    <>
+      {rows.map((r) => {
+        const open = expanded === r.symbol;
+        return (
+          <div key={r.symbol} className="rounded-xl bg-[var(--surface)] overflow-hidden">
+            <button
+              onClick={() => setExpanded(open ? null : r.symbol)}
+              className="w-full px-3 py-2.5 text-left"
+            >
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="font-semibold text-[14px]">
+                    {r.symbol.replace("USDT", "")}
+                  </span>
+                  {r.hasPosition && (
+                    <span className="rounded bg-[var(--accent)]/15 px-1 py-0.5 text-[9px] text-[var(--accent)]">
+                      OPEN
+                    </span>
+                  )}
+                  <span className="text-[10px] text-[var(--muted)] tnum">
+                    {fmtPrice(r.markPrice)}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <TfStrip timeframes={r.timeframes} />
+                  <span
+                    className={`tnum text-[13px] font-semibold w-11 text-right ${tone(r.score)}`}
+                  >
+                    {r.score >= 0 ? "+" : ""}
+                    {r.score.toFixed(2)}
+                  </span>
+                </div>
+              </div>
+              <div className="mt-1 flex items-center gap-2 text-[9px] text-[var(--muted)]">
+                <span>align {pct(r.alignment, 0)}</span>
+                <span>·</span>
+                <span>conf {pct(r.confidence, 0)}</span>
+                <span>·</span>
+                <span>{r.anchorTimeframe} {r.style}</span>
+                <span>·</span>
+                <span className={r.fundingRate > 0 ? "text-[var(--warn)]" : ""}>
+                  fund {(r.fundingRate * 100).toFixed(4)}%
+                </span>
+              </div>
+            </button>
+
+            {open && (
+              <div className="border-t border-[var(--line)] px-3 py-2 space-y-1.5">
+                {TF_ORDER.filter((tf) => r.timeframes[tf]).map((tf) => {
+                  const t = r.timeframes[tf]!;
+                  return (
+                    <div key={tf} className="text-[10px]">
+                      <div className="flex items-center justify-between">
+                        <span className="font-medium">
+                          {tf}
+                          <span className="ml-1.5 text-[var(--muted)]">{t.regime}</span>
+                        </span>
+                        <span className={`tnum ${tone(t.score)}`}>
+                          {t.score >= 0 ? "+" : ""}
+                          {t.score.toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="text-[var(--muted)] leading-relaxed">
+                        Elliott {t.elliott.pattern}
+                        {t.elliott.pattern !== "none" && `/${t.elliott.wave}`} →{" "}
+                        <span className={t.elliott.bias === "long" ? "text-[var(--up)]" : t.elliott.bias === "short" ? "text-[var(--down)]" : ""}>
+                          {t.elliott.bias}
+                        </span>{" "}
+                        ({pct(t.elliott.confidence, 0)}) · Gann{" "}
+                        <span className={t.gann.bias === "long" ? "text-[var(--up)]" : t.gann.bias === "short" ? "text-[var(--down)]" : ""}>
+                          {t.gann.bias}
+                        </span>{" "}
+                        bar {t.gann.barsSinceAnchor}/{t.gann.nearestCycle}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </>
+  );
+}
+
+/** Per-timeframe heat strip: one cell per timeframe, green long / red short. */
+function TfStrip({ timeframes }: { timeframes: Record<string, TfRead> }) {
+  return (
+    <div className="flex gap-[2px]">
+      {TF_ORDER.map((tf) => {
+        const t = timeframes[tf];
+        if (!t) {
+          return <span key={tf} className="h-4 w-[6px] rounded-sm bg-[var(--surface-2)]" />;
+        }
+        const a = Math.min(1, Math.abs(t.score) * 1.8 + 0.15);
+        const bg =
+          t.score > 0.1
+            ? `rgba(34,201,139,${a})`
+            : t.score < -0.1
+              ? `rgba(255,85,112,${a})`
+              : "var(--surface-2)";
+        return (
+          <span
+            key={tf}
+            className="h-4 w-[6px] rounded-sm"
+            style={{ background: bg }}
+            title={`${tf}: ${t.score.toFixed(2)}`}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+function HistoryTab({
+  trades,
+  stats,
+}: {
+  trades: Trade[];
+  stats: State["stats"] | undefined;
+}) {
+  return (
+    <>
+      {stats && stats.trades > 0 && (
+        <div className="rounded-xl bg-[var(--surface)] p-3">
+          <div className="grid grid-cols-4 gap-2 text-[10px]">
+            <Cell label="Trades" value={String(stats.trades)} />
+            <Cell label="Win rate" value={pct(stats.winRate, 0)} />
+            <Cell
+              label="Net P&L"
+              value={signed(stats.netPnl, 3)}
+              cls={tone(stats.netPnl)}
+            />
+            <Cell label="Costs" value={money(stats.fees + stats.funding, 3)} />
+          </div>
+          <p className="mt-2 text-[10px] leading-relaxed text-[var(--muted)]">
+            Gross {signed(stats.grossPnl, 3)} minus {money(stats.fees, 3)} fees and{" "}
+            {money(stats.funding, 4)} funding = net {signed(stats.netPnl, 3)}.
+          </p>
+        </div>
+      )}
+
+      {trades.length === 0 ? (
+        <Empty>No closed trades yet.</Empty>
+      ) : (
+        trades.map((t) => (
+          <div key={t.id} className="rounded-xl bg-[var(--surface)] px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <span className="font-medium text-[13px]">
+                  {t.symbol.replace("USDT", "")}
+                </span>
+                <span
+                  className={`text-[10px] ${t.side === "long" ? "text-[var(--up)]" : "text-[var(--down)]"}`}
+                >
+                  {t.side}
+                </span>
+                <span className="rounded bg-[var(--surface-2)] px-1 py-0.5 text-[9px] text-[var(--muted)]">
+                  {t.exitReason.replace("_", " ")}
+                </span>
+              </div>
+              <span className={`tnum text-[13px] font-semibold ${tone(t.netPnl)}`}>
+                {signed(t.netPnl, 3)}
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between text-[9px] text-[var(--muted)] tnum">
+              <span>
+                {fmtPrice(t.entryPrice)} → {fmtPrice(t.exitPrice)} · {t.rMultiple.toFixed(2)}R
+              </span>
+              <span>
+                fees {money(t.entryFee + t.exitFee, 4)} · {timeAgo(t.closedAt)}
+              </span>
+            </div>
+          </div>
+        ))
+      )}
+    </>
   );
 }

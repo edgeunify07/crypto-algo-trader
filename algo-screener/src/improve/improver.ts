@@ -3,7 +3,8 @@ import { createLogger } from "../util/logger.js";
 import { runBacktest, type BacktestResult, type SymbolData } from "../backtest/engine.js";
 import { walkForward, type WalkForwardResult } from "../backtest/walkforward.js";
 import { buildPerformanceReport } from "./report.js";
-import { LlmUnavailableError, acceptCandidate, proposeParameters } from "./llm.js";
+import { acceptCandidate, createProvider, proposeParameters } from "./llm.js";
+import { LlmUnavailableError } from "./llmProvider.js";
 import { mutateParams } from "./mutate.js";
 import {
   loadActiveParams,
@@ -14,6 +15,7 @@ import {
 } from "./paramStore.js";
 import type { StrategyParams } from "../strategy/params.js";
 import type { Timeframe } from "../types.js";
+import type { LlmProvider } from "./llmProvider.js";
 
 const log = createLogger("improve");
 
@@ -29,6 +31,8 @@ export interface ImproveOptions {
   folds?: number;
   /** Evaluate candidates but never write a promotion. */
   dryRun?: boolean;
+  /** Override the LLM provider (defaults to the configured one). */
+  provider?: LlmProvider;
 }
 
 export interface CandidateEvaluation {
@@ -170,16 +174,20 @@ export async function runImprovement(options: ImproveOptions): Promise<ImproveRe
     let candidates: { name: string; hypothesis: string; changes: string[]; params: StrategyParams }[] = [];
     let source: "llm" | "mutation" = "mutation";
     let analysis = "";
+    let servedBy = "";
 
     if (useLlm) {
       try {
+        const provider = options.provider ?? createProvider();
         const proposal = await proposeParameters({
+          provider,
           report,
           incumbent: incumbent.params,
           history: recentAttemptSummary(),
           candidateCount: candidatesPerRound,
         });
         analysis = proposal.analysis;
+        servedBy = proposal.servedBy;
         log.info(`model analysis: ${analysis}`);
         for (const candidate of proposal.candidates) {
           try {
@@ -237,7 +245,9 @@ export async function runImprovement(options: ImproveOptions): Promise<ImproveRe
     if (winner && !options.dryRun) {
       const versioned = newVersion(
         winner.params,
-        source,
+        // Record the serving model, so a promotion can be traced to the model
+        // that proposed it — OpenRouter may have routed to a fallback.
+        servedBy ? `${source}:${servedBy}` : source,
         `${winner.name}: ${winner.hypothesis}${analysis ? ` | round analysis: ${analysis}` : ""}`,
         incumbent.version,
       );

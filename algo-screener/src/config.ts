@@ -153,12 +153,41 @@ export const config = {
   },
 
   llm: {
-    apiKey: process.env.ANTHROPIC_API_KEY ?? "",
-    model: process.env.LLM_MODEL ?? "claude-opus-5-5",
-    effort: process.env.LLM_EFFORT ?? "high",
+    /**
+     * "openrouter" | "anthropic" | "auto". "auto" picks whichever provider has
+     * a key, preferring OpenRouter.
+     */
+    provider: (process.env.LLM_PROVIDER ?? "auto").toLowerCase(),
     maxTokens: num("LLM_MAX_TOKENS", 16_000),
     /** Candidate parameter sets requested per improvement round. */
     candidatesPerRound: num("LLM_CANDIDATES", 4),
+    /** Retries asking the model to fix its own schema violations. */
+    repairAttempts: num("LLM_REPAIR_ATTEMPTS", 2),
+
+    openrouter: {
+      apiKey: process.env.OPENROUTER_API_KEY ?? "",
+      baseUrl: process.env.OPENROUTER_BASE_URL ?? "https://openrouter.ai/api/v1",
+      model: process.env.OPENROUTER_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b:free",
+      /** Tried in order when the primary is unavailable or unusable. */
+      fallbackModels: (
+        process.env.OPENROUTER_FALLBACK_MODELS ??
+        "nvidia/nemotron-3-super-120b-a12b:free"
+      )
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      temperature: num("OPENROUTER_TEMPERATURE", 0.4),
+      timeoutMs: num("OPENROUTER_TIMEOUT_MS", 180_000),
+      /** Attribution headers OpenRouter shows in its dashboard. */
+      siteUrl: process.env.OPENROUTER_SITE_URL ?? "https://github.com/",
+      appName: process.env.OPENROUTER_APP_NAME ?? "algo-screener",
+    },
+
+    anthropic: {
+      apiKey: process.env.ANTHROPIC_API_KEY ?? "",
+      model: process.env.ANTHROPIC_MODEL ?? process.env.LLM_MODEL ?? "claude-opus-5-5",
+      effort: process.env.LLM_EFFORT ?? "high",
+    },
   },
 
   improve: {
