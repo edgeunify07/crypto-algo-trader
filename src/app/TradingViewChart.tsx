@@ -33,22 +33,23 @@ const INTERVALS: Record<string, string> = {
   "1d": "D",
 };
 
-const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
-
 export default function TradingViewChart({
   symbol,
   timeframe,
-  onTimeframe,
 }: {
   symbol: string;
   timeframe: string;
-  onTimeframe?: (tf: string) => void;
 }) {
-  const [tf, setTf] = useState(timeframe);
-
-  // A changed symbol or interval means a different chart, so the iframe is
-  // remounted rather than mutated — the embed has no API to steer it.
-  const interval = INTERVALS[tf] ?? "60";
+  /**
+   * The embed brings its own interval picker, so this component adds none.
+   *
+   * It did, and the result was two rows of timeframe buttons stacked on top
+   * of each other showing different selections — mine said 1h while
+   * TradingView's said 30m, because mine set the initial interval and theirs
+   * changed it afterwards without telling anyone. Only one of them was ever
+   * in control; now only one of them exists.
+   */
+  const interval = INTERVALS[timeframe] ?? "60";
   const src =
     "https://s.tradingview.com/widgetembed/?" +
     new URLSearchParams({
@@ -62,38 +63,17 @@ export default function TradingViewChart({
       locale: "en",
       toolbarbg: "0b0e14",
       hidesidetoolbar: "1",
+      // Its interval picker is the only one now, so it has to stay visible.
+      hide_top_toolbar: "0",
       symboledit: "0",
       saveimage: "0",
       withdateranges: "0",
       studies: JSON.stringify(["MAExp@tv-basicstudies", "RSI@tv-basicstudies"]),
     }).toString();
 
-  const pick = (next: string) => {
-    setTf(next);
-    onTimeframe?.(next);
-  };
-
   return (
     <div className="rounded-xl bg-[var(--surface)] overflow-hidden">
-      <div className="flex items-center gap-1 overflow-x-auto no-bar px-2 py-1.5">
-        {TIMEFRAMES.map((t) => (
-          <button
-            key={t}
-            onClick={() => pick(t)}
-            className={`shrink-0 rounded-md px-2 py-1 text-[11px] font-medium ${
-              tf === t
-                ? "bg-[var(--surface-2)] text-[var(--text)]"
-                : "text-[var(--muted)]"
-            }`}
-          >
-            {t}
-          </button>
-        ))}
-        <span className="ml-auto shrink-0 pr-1 text-[9px] text-[var(--muted)]">
-          TradingView · live
-        </span>
-      </div>
-      <div className="relative" style={{ height: 420 }}>
+      <div className="relative" style={{ height: 440 }}>
         <Frame key={src} src={src} label={symbol.replace("USDT", "")} />
       </div>
     </div>
