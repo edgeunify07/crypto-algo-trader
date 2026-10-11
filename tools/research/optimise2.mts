@@ -257,6 +257,25 @@ const stage1: { p: StrategyParams; fit: number; ret: number; trades: number }[] 
 let best: StrategyParams | undefined;
 
 for (let i = 0; i < TRIALS; i++) {
+  /**
+   * Progress first, before anything that can skip the rest of the loop.
+   *
+   * It used to sit at the bottom, after the three `continue`s that discard a
+   * failing trial — so it printed only when trial 25, 50, 75 happened to
+   * survive. That was tolerable while half of them did. Once execution costs
+   * were charged the survival rate fell to about one in ten and the run went
+   * silent for half an hour at a stretch, which is indistinguishable from a
+   * hung process and sent me looking for one.
+   */
+  if (i > 0 && i % 25 === 0) {
+    const per = (Date.now() - stage1Started) / i;
+    const left = ((TRIALS - i) * per) / 60_000;
+    console.log(
+      `  ...${i}/${TRIALS} survivors=${stage1.length} ` +
+        `(${(per / 1000).toFixed(1)}s/trial, ~${left.toFixed(0)}m left)`,
+    );
+  }
+
   const p = sample(best);
   if (!StrategyParamsSchema.safeParse(p).success) continue;
   const r = runSubset(p, warm, trainTo);
@@ -265,14 +284,6 @@ for (let i = 0; i < TRIALS; i++) {
   // Seed refinement from the best point found so far.
   stage1.sort((a, b) => b.fit - a.fit);
   best = stage1[0]!.p;
-  if ((i + 1) % 25 === 0) {
-    const per = (Date.now() - stage1Started) / (i + 1);
-    const left = ((TRIALS - i - 1) * per) / 60_000;
-    console.log(
-      `  ...${i + 1}/${TRIALS} survivors=${stage1.length} ` +
-        `(${(per / 1000).toFixed(1)}s/trial, ~${left.toFixed(0)}m left)`,
-    );
-  }
 }
 
 console.log(`stage 1 survivors: ${stage1.length}, taking top ${KEEP}`);
