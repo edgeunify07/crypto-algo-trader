@@ -19,9 +19,19 @@
 #                limit does not apply.
 #
 # Notes:
-#   - GitHub runs scheduled workflows on a best-effort basis; under load a run
-#     can be delayed by several minutes. The tick is idempotent and holds a
-#     lock, so a late or doubled run is harmless.
+#   - GitHub runs scheduled workflows on a best-effort basis, and "best
+#     effort" is weaker than it sounds: measured on this repository, a */5
+#     schedule fired ONCE in nine hours instead of about a hundred times.
+#     Runs are silently dropped under load rather than queued. So each run
+#     that does fire ticks several times across its budget instead of once —
+#     it does not fix the gaps, but it makes a surviving run worth more.
+#
+#     This matters beyond trade entries: the engine only checks stops when it
+#     ticks, so a long gap means a stop can be overshot well past its price
+#     before anything notices. If the account is ever to be taken seriously,
+#     point a real scheduler at /api/v2/tick — it needs no credentials.
+#   - The tick is idempotent and holds a lock, so a late or doubled run is
+#     harmless.
 #   - GitHub disables schedules after 60 days with no repository activity.
 #     Push a commit, or press "Run workflow", to re-arm it.
 
@@ -45,7 +55,9 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Four ticks, three 65s waits, and curl allowed 60s each: 7m15s in the
+    # worst case, against about 3m30s typically.
+    timeout-minutes: 9
     steps:
       - name: Advance the trading loop
         env:
@@ -75,12 +87,28 @@ jobs:
             auth=(-H "Authorization: Bearer ${CRON_SECRET}")
           fi
 
-          # --fail-with-body so a non-2xx still prints why it failed.
-          response=$(curl --silent --show-error --fail-with-body \
-            --max-time 90 --retry 2 --retry-delay 5 \
-            -X POST "${APP_URL}/api/v2/tick" "${auth[@]}")
+          # Several ticks per run, spaced just past the endpoint's
+          # one-per-minute limit for anonymous callers. The job's own
+          # timeout-minutes is the backstop.
+          response=""
+          for attempt in 1 2 3 4; do
+            # `[ ... ] && sleep` would return non-zero on the first pass and
+            # `set -e` would end the script there, before a single tick.
+            if [ "$attempt" -gt 1 ]; then sleep 65; fi
+            # --fail-with-body so a non-2xx still prints why it failed.
+            response=$(curl --silent --show-error --fail-with-body \
+              --max-time 60 --retry 2 --retry-delay 5 \
+              -X POST "${APP_URL}/api/v2/tick" "${auth[@]}") || {
+                echo "::warning::tick $attempt failed"
+                continue
+              }
+            echo "tick $attempt: $response"
+          done
 
-          echo "$response"
+          if [ -z "$response" ]; then
+            echo "::error::every tick in this run failed"
+            exit 1
+          fi
 
           # Surface the outcome in the run summary. jq is preinstalled on
           # ubuntu-latest; the // fallbacks keep this working if a field is absent.
