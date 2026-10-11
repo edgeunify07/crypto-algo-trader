@@ -145,17 +145,17 @@ export default function BacktestPanel({ days = 30 }: { days?: number }) {
 
         {/*
           The in-sample figure is still shown, just never as the headline —
-          hiding it entirely would invite someone to re-derive it and trust it.
+          hiding it entirely would invite someone to re-derive it and trust
+          it. Only when it differs from the headline: with no clean window
+          the two are the same number, and printing it twice reads as two
+          pieces of evidence rather than one.
         */}
-        {data.inSampleDays > 0 && (
+        {oos && data.inSampleDays > 0 && (
           <div className="mt-1.5 flex items-center justify-between text-[9px] text-[var(--muted)]">
-            <span>
-              {oos
-                ? `${data.inSampleDays}d of this window was used to tune the params`
-                : "the whole window was used to tune the params"}
-            </span>
+            <span>{data.inSampleDays}d of this window was used to tune the params</span>
             <span className="tnum">
-              {data.days}d: <span className={tone(data.totalReturn)}>{pct(data.totalReturn, 1)}</span>
+              whole {data.days}d:{" "}
+              <span className={tone(data.totalReturn)}>{pct(data.totalReturn, 1)}</span>
             </span>
           </div>
         )}
