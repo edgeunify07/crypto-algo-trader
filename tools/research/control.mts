@@ -20,11 +20,18 @@
  * them contradict, which tests nothing.
  */
 import { runFuturesBacktest, type BacktestInput, type BacktestResult } from "@/lib/improve2/backtest";
-import { DEFAULT_PARAMS } from "@/lib/algo/strategy/params";
+import {
+  DEFAULT_PARAMS,
+  StrategyParamsSchema,
+  sanitiseParams,
+  type StrategyParams,
+} from "@/lib/algo/strategy/params";
 import type { Candle, Timeframe } from "@/lib/algo/types";
 import fs from "node:fs";
 
 const OUT = process.env.OUT ?? "/tmp";
+/** Which parameters to test; defaults to the shipped ones. */
+const PARAMS_FILE = process.env.PARAMS ?? "";
 const CACHE = process.env.CACHE ?? `${OUT}/klines120x24.json`;
 const RUNS = Number(process.env.RUNS ?? "12");
 const BLOCK = Number(process.env.BLOCK ?? "32"); // 15m bars: 8 hours
@@ -120,6 +127,15 @@ function aggregate(fine: Candle[], n: number): Candle[] {
   return out;
 }
 
+const params: StrategyParams = PARAMS_FILE
+  ? sanitiseParams(
+      StrategyParamsSchema.parse(
+        (JSON.parse(fs.readFileSync(PARAMS_FILE, "utf8")) as { params: unknown }).params,
+      ),
+    ).params
+  : DEFAULT_PARAMS;
+console.log(PARAMS_FILE ? `params from ${PARAMS_FILE}` : "shipped default params");
+
 const bySym = JSON.parse(fs.readFileSync(CACHE, "utf8")) as Record<string, Record<string, Candle[]>>;
 const symbols = Object.keys(bySym);
 console.log(`${symbols.length} symbols from ${CACHE}`);
@@ -137,7 +153,7 @@ const day = (t: number) => new Date(t).toISOString().slice(0, 10);
 console.log(`window ${day(from)} -> ${day(latest)}\n`);
 
 const run = (data: BacktestInput[]) =>
-  runFuturesBacktest(data, DEFAULT_PARAMS, {
+  runFuturesBacktest(data, params, {
     stepTimeframe: STEP,
     startingBalance: 100,
     from,

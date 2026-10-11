@@ -106,6 +106,63 @@ export const StrategyParamsSchema = z.object({
     useStructuralTargets: z.boolean(),
   }),
 
+  /**
+   * High-conviction scalp: take a fixed percentage move and close.
+   *
+   * Two measurements shape the defaults here, and the second is the reason
+   * the threshold is set where it is.
+   *
+   * `minConfidence` runs on the engine's own confidence scale, which is a
+   * weighted blend of per-timeframe confidences and not a probability. Over
+   * 120 days and 24 symbols it reached 0.80 six times in 6,768 evaluations
+   * and never passed 0.86, so a threshold chosen by intuition from the word
+   * "confidence" barely fires at all: 0.80 is roughly one trade a month.
+   *
+   * Lowering it to where it fires often makes the account worse, which is
+   * not what the win rate suggests. Over 83 out-of-sample days on one
+   * account:
+   *
+   *     threshold   scalps   won    scalp P&L   account
+   *     off              0     —            —   +22.04%
+   *     >=0.72           4   4/4      +$10.86   +17.21%
+   *     >=0.70           9   9/9      +$23.90   +13.43%
+   *     >=0.68          14  14/14     +$52.51    +9.74%
+   *
+   * Every scalp won — 29 of 29 across the sweep — and each one left the
+   * account poorer. They are not losing trades; they are winning trades
+   * taken instead of better ones. A scalp pre-empts the swing entry on the
+   * same signal and closes at a fixed 5% a position the swing exits would
+   * have carried further, while paying a second taker fee to do it. The
+   * profit is real and the opportunity cost is larger.
+   *
+   * So the threshold stays at 0.80, where the rule fires on genuine
+   * outliers and cannot quietly eat the swing book. Lower it only with that
+   * table in view.
+   */
+  scalp: z
+    .object({
+      enabled: z.boolean(),
+      /** Blended confidence at or above which a signal becomes a scalp. */
+      minConfidence: z.number().min(0.3).max(0.99),
+      /** Take profit at this fractional move in the position's favour. */
+      targetPct: z.number().min(0.005).max(0.5),
+      /** Give up after this many bars on the anchor timeframe. */
+      maxHoldBars: z.number().int().min(1).max(500),
+      /**
+       * Stop distance in ATR multiples, overriding the swing stop. A scalp
+       * that needs a swing-sized stop is not a scalp: the position would be
+       * sized down to nothing to keep the same risk.
+       */
+      atrStopMultiple: z.number().min(0.3).max(4),
+    })
+    .default({
+      enabled: true,
+      minConfidence: 0.8,
+      targetPct: 0.05,
+      maxHoldBars: 24,
+      atrStopMultiple: 1.2,
+    }),
+
   risk: z.object({
     riskPerTrade: z.number().min(0.001).max(0.05),
     maxOpenPositions: z.number().int().min(1).max(20),
@@ -130,27 +187,47 @@ export interface VersionedParams {
 }
 
 /**
- * Baseline parameters, found by random search over 60 days of real USDⓈ-M
- * futures klines on the top-10 universe, with a three-way split: searched on
- * the oldest 40%, ranked on the middle 25%, then scored once on the most
- * recent 35%, which nothing in the search had seen.
+ * Baseline parameters, from a two-stage search over 120 days of real USDⓈ-M
+ * futures klines.
  *
- *            trades   return   maxDD   PF     fees
- *   train        33   +17.2%    7.5%   2.71   $2.16
- *   validate     13   +32.3%    1.6%  17.89   $0.36
- *   test         25    +4.5%   11.9%   1.31   $0.97
+ * Stage one ran 400 random trials on the oldest 35% and kept the 212 that
+ * were profitable there; the best 40 were then scored across four *disjoint*
+ * later windows on the full 24-symbol pool, and 16 held up in at least three
+ * of four with no liquidation. This is the best median of those.
  *
- * The previous defaults returned -7.6% on that same test window across 283
- * trades, paying $19.64 in commission. The entire difference is selectivity:
- * `minAlignment` at 0.93 demands near-total agreement across timeframes, which
- * is what takes 283 trades down to 25 and the fee bill with it. On a $100
- * account at 0.05% per side, trade count is the dominant cost.
+ * Every backtest behind it ranks the universe point-in-time, by the trailing
+ * volume each step actually had, rather than over today's top ten. That
+ * distinction is not academic: the previous defaults scored +26% on the last
+ * 30 days the old way and -2.7% once the ranking was honest.
  *
- * Three of the five finalists stayed profitable on the untouched window, so
- * this is a region that holds rather than a single lucky point. It is still a
- * 60-day sample in one market regime, the test window was used once to choose
- * among those five, and 25 trades is a small sample — this is a starting
- * point for the improvement loop to beat, not a forecast.
+ * Re-measured by the current engine — drawdown halt, equity marked with
+ * unrealised P&L, live concurrency cap — across the four out-of-sample
+ * windows:
+ *
+ *            trades   return   maxDD   PF
+ *   OOS1         16   +42.1%   12.0%   4.55
+ *   OOS2         30   +42.5%   15.4%   2.69
+ *   OOS3         12    +6.8%    5.1%   2.00
+ *   OOS4         22    +5.0%    7.5%   1.34
+ *
+ * The shipped defaults these replace managed a -1.9% median on the same four,
+ * profitable in two of them, with one liquidation.
+ *
+ * Read as one continuous account rather than four fresh ones — which is the
+ * only figure anybody can spend — that is **+22.0% over 83 out-of-sample
+ * days**, a 15.4% worst drawdown and no liquidations, against -15.5% for the
+ * parameters it replaces. Compounding the four windows gives a much larger
+ * number; it describes four separate accounts and is not quoted here.
+ *
+ * Against a control: the same parameters over twelve synthetic series that
+ * keep each symbol's bar shapes and volatility but shuffle the order in
+ * eight-hour blocks returned a median of -27.8%, and the real series beat all
+ * twelve. The entries are reading market structure, not noise.
+ *
+ * What this is not: 16 candidates cleared the bar and this is the best of
+ * them, chosen on the same windows it is reported against, so expect less
+ * live than the table shows. Four months is one market regime. The
+ * improvement loop exists to beat this, not to be trusted by it.
  */
 /**
  * The last moment of market data that influenced `DEFAULT_PARAMS`.
@@ -162,80 +239,89 @@ export interface VersionedParams {
  * without it, the natural thing to show is "the last 30 days", which for
  * freshly fitted parameters is the one window guaranteed to flatter them.
  *
- * Set to the end of the test slice rather than of the training slice: the
- * test window was unseen during the search, but it still picked the winner
- * out of the five finalists, so it is not untouched either.
+ * Set to the end of the validation slice rather than of the training slice.
+ * The four out-of-sample windows were unseen during the search itself, but
+ * they still chose this candidate out of forty, so they are not untouched
+ * either and a backtest over them would flatter these parameters.
  */
-export const DEFAULT_PARAMS_FITTED_THROUGH = Date.UTC(2026, 9, 10);
+export const DEFAULT_PARAMS_FITTED_THROUGH = Date.UTC(2026, 9, 11);
 
 export const DEFAULT_PARAMS: StrategyParams = {
   weights: {
-    emaTrend: 2.04,
-    macd: 1.61,
-    rsi: 0.96,
-    adx: 0.89,
-    bollinger: 1.11,
-    volume: 0.51,
-    structure: 0.55,
-    elliott: 0.76,
-    gann: 2.14,
+    emaTrend: 0.810899,
+    macd: 2.03637,
+    rsi: 0.372427,
+    adx: 0.453101,
+    bollinger: 0.449826,
+    volume: 0.662844,
+    structure: 2.08622,
+    elliott: 0.918342,
+    gann: 1.18951,
   },
   indicators: {
-    emaFast: 23,
-    emaSlow: 76,
-    rsiPeriod: 11,
+    emaFast: 39,
+    emaSlow: 170,
+    rsiPeriod: 22,
     rsiOverbought: 70,
     rsiOversold: 30,
-    atrPeriod: 9,
+    atrPeriod: 24,
     macdFast: 12,
     macdSlow: 26,
     macdSignal: 9,
     bbPeriod: 20,
     bbMultiplier: 2,
-    adxThreshold: 33.59,
-    zigzagAtrMultiple: 3.11,
+    adxThreshold: 16.9062,
+    zigzagAtrMultiple: 3.843,
   },
   timeframeWeights: {
     "1m": 0.2,
     "3m": 0.3,
-    "5m": 1.2,
-    "15m": 2.0,
+    "5m": 0.607774,
+    "15m": 0.589945,
     "30m": 0.85,
-    "1h": 2.04,
+    "1h": 1.51795,
     "2h": 1.1,
-    "4h": 2.21,
+    "4h": 1.10784,
     "6h": 1.3,
     "12h": 1.4,
-    "1d": 0.99,
+    "1d": 0.756526,
     "3d": 1.3,
     "1w": 1.2,
   },
   entry: {
-    minScore: 0.52,
-    minConfidence: 0.64,
-    minAlignment: 0.93,
+    minScore: 0.537952,
+    minConfidence: 0.307368,
+    minAlignment: 0.701781,
     minQuoteVolume24h: 50000000,
     requireElliottAgreement: false,
-    requireGannAgreement: false,
+    requireGannAgreement: true,
     avoidGannTimeCycle: false,
     allowShorts: true,
   },
   exit: {
-    atrStopMultiple: 2.71,
-    takeProfitRMultiples: [1.28, 2.13],
-    takeProfitFractions: [0.5, 0.5],
-    trailStartR: 1.68,
-    trailAtrMultiple: 3.06,
-    breakEvenR: 2.49,
-    maxHoldBars: 146,
-    exitOnScoreFlip: 0.49,
-    useStructuralTargets: false,
+    atrStopMultiple: 4.00087,
+    takeProfitRMultiples: [2.4],
+    takeProfitFractions: [1],
+    trailStartR: 0.796014,
+    trailAtrMultiple: 3.91327,
+    breakEvenR: 1.15497,
+    maxHoldBars: 54,
+    exitOnScoreFlip: 0.185211,
+    useStructuralTargets: true,
   },
   risk: {
     riskPerTrade: 0.01,
     maxOpenPositions: 5,
     maxPositionFraction: 0.25,
     volatilityTargetAtrPct: 0.03,
+  },
+  scalp: {
+    enabled: true,
+    // Rare by design — see the measured table in the schema above.
+    minConfidence: 0.8,
+    targetPct: 0.05,
+    maxHoldBars: 24,
+    atrStopMultiple: 1.2,
   },
 };
 

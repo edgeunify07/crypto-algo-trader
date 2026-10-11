@@ -37,6 +37,14 @@ export interface FuturesPosition {
   lastFundingAt: number;
   timeframe: Timeframe;
   style: TradeStyle;
+  /**
+   * Opened by the high-conviction scalp rule: fixed percentage target, short
+   * clock, no swing trailing. Stored on the position rather than inferred
+   * from `style`, which is only a label derived from the anchor timeframe —
+   * a 4h anchor can still produce a scalp, and the exit rules must follow
+   * how the position was opened, not what it is called.
+   */
+  scalp?: boolean;
   paramsVersion: string;
   /** Why the engine opened this, shown in the UI. */
   reasons: string[];
@@ -49,7 +57,13 @@ export type ExitReason =
   | "signal_flip"
   | "max_hold"
   | "liquidation"
-  | "manual";
+  | "manual"
+  // Scalps get their own two, so the trade history can be read apart from
+  // the swing book: whether the fast trades pay for themselves is the whole
+  // question about them, and it cannot be answered if their exits are
+  // tallied under the same names.
+  | "scalp_target"
+  | "scalp_timeout";
 
 export interface FuturesTrade {
   id: string;
