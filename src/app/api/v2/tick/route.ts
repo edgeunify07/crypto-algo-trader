@@ -15,7 +15,9 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 async function handle(request: Request) {
-  if (!isAuthorised(request)) {
+  // The open dashboard is this loop's primary scheduler, so its own fetches
+  // count as authorised even once a cron secret is configured.
+  if (!isAuthorised(request, { allowSameOrigin: true })) {
     return NextResponse.json({ error: "unauthorised" }, { status: 401 });
   }
 

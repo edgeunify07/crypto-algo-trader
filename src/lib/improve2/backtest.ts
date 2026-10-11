@@ -116,6 +116,63 @@ function aggregate(
   };
 }
 
+/**
+ * Which symbols the engine would have been allowed to trade at each step.
+ *
+ * The live engine rebuilds its universe every UTC day from the top-N
+ * perpetuals by 24h quote volume. Replaying it over a pool fixed at *today's*
+ * ranking quietly asks a different question: those are the coins that already
+ * had the month's biggest moves, so the strategy is scored only on the
+ * survivors and the return it reports is one no live account could have
+ * earned. Ranking on the volume that had actually printed by each step gives
+ * the backtest the same partial information the engine had.
+ *
+ * The pool is still drawn from today's listings, so a symbol that was
+ * delisted mid-window is missing entirely. That residual bias is why the
+ * dashboard says which pool a run used rather than presenting the number bare.
+ */
+export function pointInTimeUniverse(
+  data: BacktestInput[],
+  stepTimeframe: Timeframe,
+  clock: number[],
+  size: number,
+): Map<number, Set<string>> {
+  const WINDOW_MS = 24 * 3_600_000;
+
+  // Prefix sums plus a cursor that only moves forward, so ranking every step
+  // costs one pass over the bars rather than one scan per step.
+  const series = data.map((d) => {
+    const candles = d.byTimeframe.get(stepTimeframe) ?? [];
+    const prefix = new Float64Array(candles.length + 1);
+    for (let i = 0; i < candles.length; i++) {
+      prefix[i + 1] = (prefix[i] as number) + ((candles[i] as Candle).quoteVolume || 0);
+    }
+    return { symbol: d.symbol, candles, prefix, end: 0, start: 0 };
+  });
+
+  const eligible = new Map<number, Set<string>>();
+  const ranked: { symbol: string; volume: number }[] = [];
+
+  for (const now of clock) {
+    ranked.length = 0;
+    const floor = now - WINDOW_MS;
+    for (const s of series) {
+      while (s.end < s.candles.length && (s.candles[s.end] as Candle).closeTime <= now) s.end++;
+      while (s.start < s.end && (s.candles[s.start] as Candle).closeTime <= floor) s.start++;
+      // No bars yet means the symbol had not started trading — not eligible,
+      // rather than eligible with zero volume.
+      if (s.end === 0) continue;
+      ranked.push({
+        symbol: s.symbol,
+        volume: (s.prefix[s.end] as number) - (s.prefix[s.start] as number),
+      });
+    }
+    ranked.sort((a, b) => b.volume - a.volume);
+    eligible.set(now, new Set(ranked.slice(0, size).map((r) => r.symbol)));
+  }
+  return eligible;
+}
+
 export function runFuturesBacktest(
   data: BacktestInput[],
   params: StrategyParams,
@@ -136,6 +193,12 @@ export function runFuturesBacktest(
     from?: number;
     /** Only trade bars closing at or before this time. */
     to?: number;
+    /**
+     * Re-rank the symbols by trailing 24h volume at every step and only allow
+     * entries in the top `universeSize`, mirroring the live engine's daily
+     * universe. Leave unset to trade everything passed in.
+     */
+    universeSize?: number;
   } = {},
 ): BacktestResult {
   const {
@@ -190,6 +253,11 @@ export function runFuturesBacktest(
       totalFunding: 0, liquidations: 0, fitness: -1, from: 0, to: 0,
     };
   }
+
+  const eligible =
+    options.universeSize !== undefined && options.universeSize < data.length
+      ? pointInTimeUniverse(data, stepTimeframe, clock, options.universeSize)
+      : null;
 
   const state = new Map<
     string,
@@ -376,6 +444,10 @@ export function runFuturesBacktest(
 
       // --- entry on the next bar's open ---
       if (bankrupt) continue;
+      // Gates entries only: a position already open is managed to its exit
+      // even if its symbol drops out of the ranking, which is what the live
+      // engine does too.
+      if (eligible && !eligible.get(now)?.has(d.symbol)) continue;
       // Concurrency cap, matching the live risk manager.
       const openCount = [...state.values()].filter((x) => x.open !== null).length;
       if (openCount >= maxOpenPositions) continue;

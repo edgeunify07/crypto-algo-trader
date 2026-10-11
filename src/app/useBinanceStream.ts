@@ -81,14 +81,18 @@ interface RawAggTradeMsg {
   T: number;
   m: boolean;
 }
+/**
+ * Futures partial-book depth.
+ *
+ * The futures stream names its sides `b` and `a`, unlike the spot REST
+ * endpoint's `bids`/`asks`. Matching on the REST spelling silently never fires,
+ * which is a quiet failure: the socket connects, messages arrive, and the book
+ * simply never updates.
+ */
 interface RawDepthMsg {
   e: "depthUpdate";
   b: [string, string][];
   a: [string, string][];
-}
-interface RawPartialDepth {
-  bids: [string, string][];
-  asks: [string, string][];
 }
 interface RawTickerMsg {
   e: "24hrTicker";
@@ -192,7 +196,6 @@ export function useBinanceStream(
           | RawAggTradeMsg
           | RawDepthMsg
           | RawTickerMsg
-          | RawPartialDepth
           | undefined;
         if (!data) return;
 
@@ -237,10 +240,9 @@ export function useBinanceStream(
           return;
         }
 
-        // Partial book depth arrives without an event name.
-        if (stream.includes("@depth") && "bids" in data && "asks" in data) {
-          const bids = cumulate(data.bids, 12);
-          const asks = cumulate(data.asks, 12);
+        if ("e" in data && data.e === "depthUpdate") {
+          const bids = cumulate(data.b, 12);
+          const asks = cumulate(data.a, 12);
           const bestBid = bids[0]?.price ?? 0;
           const bestAsk = asks[0]?.price ?? 0;
           setState((s) => ({
@@ -253,7 +255,9 @@ export function useBinanceStream(
               spreadPct: bestAsk && bestBid ? (bestAsk - bestBid) / bestBid : 0,
             },
           }));
+          return;
         }
+        void stream;
       };
 
       const fail = () => {

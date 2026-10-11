@@ -1,5 +1,6 @@
 import {
   DEFAULT_PARAMS,
+  DEFAULT_PARAMS_FITTED_THROUGH,
   StrategyParamsSchema,
   sanitiseParams,
   type StrategyParams,
@@ -59,6 +60,11 @@ export interface StoredParams {
   rationale: string;
   parentVersion: string | null;
   updatedAt: number;
+  /**
+   * Last moment of market data that influenced these parameters. A backtest
+   * window at or before this is in-sample and the dashboard labels it as such.
+   */
+  fittedThrough: number;
   params: StrategyParams;
   evidence?: {
     totalReturn: number;
@@ -82,7 +88,15 @@ export async function loadParams(): Promise<StoredParams> {
   if (stored) {
     const parsed = StrategyParamsSchema.safeParse(stored.params);
     if (parsed.success) {
-      return { ...stored, params: sanitiseParams(parsed.data).params };
+      return {
+        ...stored,
+        // Records written before this field existed: fall back to when they
+        // were promoted. Defaulting to 0 instead would present a window the
+        // search had seen as untouched, which is the error this field exists
+        // to prevent.
+        fittedThrough: stored.fittedThrough ?? stored.updatedAt ?? Date.now(),
+        params: sanitiseParams(parsed.data).params,
+      };
     }
   }
   return {
@@ -91,6 +105,7 @@ export async function loadParams(): Promise<StoredParams> {
     rationale: "Baseline parameters shipped with the engine.",
     parentVersion: null,
     updatedAt: Date.now(),
+    fittedThrough: DEFAULT_PARAMS_FITTED_THROUGH,
     params: structuredClone(DEFAULT_PARAMS),
   };
 }
@@ -300,6 +315,9 @@ export async function runImprovement(options: ImproveOptions = {}): Promise<Impr
       rationale: `${winner.name}: ${winner.hypothesis}`,
       parentVersion: incumbent.version,
       updatedAt: Date.now(),
+      // The round scored this candidate on bars up to the latest one it
+      // loaded, so everything through now is in-sample for it.
+      fittedThrough: incumbentResult.to || Date.now(),
       params,
       evidence: {
         totalReturn: winner.result.totalReturn,

@@ -13,7 +13,42 @@ import { KEYS, kv } from "@/lib/store/kv";
  *    thing standing between one tick and a double-sized position.
  */
 
-export function isAuthorised(request: Request): boolean {
+/**
+ * Was this request made by a browser from a page on this same deployment?
+ *
+ * `Sec-Fetch-Site` is on the forbidden header list, so page script cannot set
+ * it: a `fetch()` from another site arrives as `cross-site` no matter what
+ * that site does. It is not a defence against a crafted request — curl will
+ * happily send any header — but it does not need to be. The dashboard is the
+ * loop's own scheduler, so anyone who can open the page can already make it
+ * tick; the point is only to separate "our page, in a browser" from a crawler
+ * following a link or another site posting at us.
+ */
+function isSameOriginBrowserRequest(request: Request): boolean {
+  const site = request.headers.get("sec-fetch-site");
+  if (site !== "same-origin") return false;
+  // A top-level navigation to the URL is not the dashboard calling the API;
+  // the page uses `fetch`, which reports `cors` (or `same-origin`).
+  return request.headers.get("sec-fetch-mode") !== "navigate";
+}
+
+export interface AuthOptions {
+  /**
+   * Accept a `fetch` from the deployment's own page as well as the secret.
+   *
+   * Set on `/api/v2/tick` only. Without it a deployment that configures
+   * `CRON_SECRET` — which the deploy guide tells everyone to do — rejects
+   * every tick the open dashboard sends, and the loop silently never runs:
+   * the UI shows "idle" with a tick count stuck at zero while the external
+   * cron, five minutes apart, is the only thing getting through.
+   *
+   * The destructive and expensive endpoints (`reset`, `improve`) leave it off
+   * and keep requiring the secret.
+   */
+  allowSameOrigin?: boolean;
+}
+
+export function isAuthorised(request: Request, options: AuthOptions = {}): boolean {
   const secret = process.env.CRON_SECRET ?? "";
   // No secret configured: open, which is the convenient default for a private
   // deployment driven only by its own UI.
@@ -23,7 +58,9 @@ export function isAuthorised(request: Request): boolean {
   if (header === `Bearer ${secret}`) return true;
 
   const url = new URL(request.url);
-  return url.searchParams.get("secret") === secret;
+  if (url.searchParams.get("secret") === secret) return true;
+
+  return options.allowSameOrigin === true && isSameOriginBrowserRequest(request);
 }
 
 export async function withTickLock<T>(

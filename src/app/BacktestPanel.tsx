@@ -9,6 +9,13 @@ import { useEffect, useState } from "react";
  * strategy is not "what is it about to do" but "does this actually work" —
  * and the only answer available before it has traded for months is a replay
  * over real data, with the same fees and funding the live engine pays.
+ *
+ * The number in the big type is the one the search had not seen. A backtest
+ * over a window the parameters were fitted on will happily print twenty or
+ * thirty percent, and showing that as the headline is the single most
+ * misleading thing this screen could do: it is a measurement of the search,
+ * not a forecast of the account. When no clean window exists yet the panel
+ * says so instead of substituting the flattering one.
  */
 
 interface Backtest {
@@ -29,6 +36,20 @@ interface Backtest {
   bySymbol: { symbol: string; trades: number; netPnl: number }[];
   byReason: { reason: string; trades: number; netPnl: number }[];
   equityCurve: { t: number; equity: number }[];
+  poolSize: number;
+  universeSize: number;
+  fittedThrough: number;
+  inSampleDays: number;
+  outOfSample: {
+    from: number;
+    to: number;
+    days: number;
+    totalReturn: number;
+    trades: number;
+    winRate: number;
+    profitFactor: number;
+    maxDrawdown: number;
+  } | null;
   cached: boolean;
   ranAt: number;
   error?: string;
@@ -81,35 +102,75 @@ export default function BacktestPanel({ days = 30 }: { days?: number }) {
     );
   }
 
-  const profitable = data.totalReturn > 0;
+  // Everything the search had already seen is in-sample; only the remainder
+  // says anything about the future. `oos` is null when there is no remainder.
+  const oos = data.outOfSample;
+  const headline = oos ?? {
+    totalReturn: data.totalReturn,
+    trades: data.trades,
+    winRate: data.winRate,
+    profitFactor: data.profitFactor,
+    maxDrawdown: data.maxDrawdown,
+    days: data.days,
+  };
+  const profitable = headline.totalReturn > 0;
 
   return (
     <div className="rounded-xl bg-[var(--surface)] overflow-hidden">
       <button onClick={() => setOpen(!open)} className="w-full px-3 pt-2.5 pb-2 text-left">
         <div className="flex items-center justify-between">
           <span className="text-[9px] uppercase tracking-wider text-[var(--muted)]">
-            Backtest · last {data.days}d · real data
+            {oos ? `Out of sample · ${oos.days}d` : `Backtest · last ${data.days}d`} · real data
           </span>
           <span className="text-[9px] text-[var(--muted)]">{open ? "hide" : "detail"}</span>
         </div>
 
         <div className="mt-1 flex items-baseline gap-2">
-          <span className={`text-[22px] font-semibold tnum ${tone(data.totalReturn)}`}>
-            {pct(data.totalReturn, 2)}
+          <span className={`text-[22px] font-semibold tnum ${tone(headline.totalReturn)}`}>
+            {pct(headline.totalReturn, 2)}
           </span>
           <span className="text-[11px] text-[var(--muted)] tnum">
-            {money(data.startingBalance, 0)} → {money(data.finalEquity)}
+            {headline.trades} trades · {money(data.startingBalance, 0)} start
           </span>
         </div>
 
         <EquitySpark points={data.equityCurve} start={data.startingBalance} />
 
         <div className="mt-2 grid grid-cols-4 gap-1.5 text-[9px]">
-          <Cell label="Trades" value={String(data.trades)} />
-          <Cell label="Win" value={pct(data.winRate, 0)} />
-          <Cell label="PF" value={data.profitFactor.toFixed(2)} cls={tone(data.profitFactor - 1)} />
-          <Cell label="Max DD" value={pct(data.maxDrawdown, 0)} />
+          <Cell label="Trades" value={String(headline.trades)} />
+          <Cell label="Win" value={pct(headline.winRate, 0)} />
+          <Cell label="PF" value={headline.profitFactor.toFixed(2)} cls={tone(headline.profitFactor - 1)} />
+          <Cell label="Max DD" value={pct(headline.maxDrawdown, 0)} />
         </div>
+
+        {/*
+          The in-sample figure is still shown, just never as the headline —
+          hiding it entirely would invite someone to re-derive it and trust it.
+        */}
+        {data.inSampleDays > 0 && (
+          <div className="mt-1.5 flex items-center justify-between text-[9px] text-[var(--muted)]">
+            <span>
+              {oos
+                ? `${data.inSampleDays}d of this window was used to tune the params`
+                : "the whole window was used to tune the params"}
+            </span>
+            <span className="tnum">
+              {data.days}d: <span className={tone(data.totalReturn)}>{pct(data.totalReturn, 1)}</span>
+            </span>
+          </div>
+        )}
+
+        {!oos && (
+          <div
+            className="mt-2 rounded-lg px-2 py-1.5 text-[10px] leading-relaxed"
+            style={{ background: "rgba(245,185,66,.12)", color: "var(--warn)" }}
+          >
+            No untouched window yet — the search that chose these parameters saw
+            all of this data, so the figure above measures the search, not the
+            strategy. It becomes meaningful as days accumulate past{" "}
+            {new Date(data.fittedThrough).toISOString().slice(0, 10)}.
+          </div>
+        )}
 
         {/* Fees are the headline risk on a $100 account; never bury them. */}
         <div className="mt-1.5 text-[9px] leading-relaxed text-[var(--muted)]">
@@ -120,14 +181,14 @@ export default function BacktestPanel({ days = 30 }: { days?: number }) {
           )}
         </div>
 
-        {!profitable && (
+        {!profitable && oos && (
           <div
             className="mt-2 rounded-lg px-2 py-1.5 text-[10px] leading-relaxed"
             style={{ background: "rgba(245,185,66,.12)", color: "var(--warn)" }}
           >
-            These parameters lost money over this window. The engine will still
-            trade them — promotion only happens when the improvement loop finds
-            something measurably better.
+            These parameters lost money over the window the search had not
+            seen. The engine will still trade them — promotion only happens
+            when the improvement loop finds something measurably better.
           </div>
         )}
       </button>
@@ -145,9 +206,15 @@ export default function BacktestPanel({ days = 30 }: { days?: number }) {
             ))}
           </Section>
           <p className="pt-1 text-[9px] leading-relaxed text-[var(--muted)]">
-            Params {data.paramsVersion}. Fills use the mark price with no
-            slippage or order-book depth, so a real account would do slightly
-            worse. Past results are not a forecast.
+            Params {data.paramsVersion}, fitted on data through{" "}
+            {new Date(data.fittedThrough).toISOString().slice(0, 10)}. Ranked
+            point-in-time across {data.poolSize} symbols, {data.universeSize} tradable
+            at a time, on the trailing volume each step actually had — so the
+            run is not handed the coins that turned out to move most. The pool
+            is drawn from symbols listed today, so anything delisted mid-window
+            is missing. Fills use the mark price with no slippage or order-book
+            depth, so a real account would do slightly worse. Past results are
+            not a forecast.
           </p>
         </div>
       )}

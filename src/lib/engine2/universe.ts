@@ -37,20 +37,16 @@ export function utcDay(time = Date.now()): string {
   return new Date(time).toISOString().slice(0, 10);
 }
 
-export async function resolveUniverse(
-  options: { force?: boolean; size?: number } = {},
-): Promise<UniverseSnapshot> {
-  const { force = false, size = UNIVERSE_SIZE } = options;
-  const store = kv();
-  const today = utcDay();
-
-  if (!force) {
-    const cached = await store.get<UniverseSnapshot>(KEYS.universe);
-    if (cached && cached.day === today && cached.entries.length > 0) return cached;
-  }
-
-  const tickers = await fetchFuturesTickers();
-  const entries = tickers
+/**
+ * The ranking itself, split out from the caching so a caller that wants a
+ * different slice — the backtest asks for a wider pool to choose from — can
+ * rank without overwriting the day's cached universe underneath the engine.
+ */
+export function rankUniverse(
+  tickers: Awaited<ReturnType<typeof fetchFuturesTickers>>,
+  size: number,
+): UniverseEntry[] {
+  return tickers
     .filter(
       (t) =>
         t.symbol.endsWith("USDT") &&
@@ -67,6 +63,22 @@ export async function resolveUniverse(
       lastPrice: t.lastPrice,
       priceChangePercent: t.priceChangePercent,
     }));
+}
+
+export async function resolveUniverse(
+  options: { force?: boolean; size?: number } = {},
+): Promise<UniverseSnapshot> {
+  const { force = false, size = UNIVERSE_SIZE } = options;
+  const store = kv();
+  const today = utcDay();
+
+  if (!force) {
+    const cached = await store.get<UniverseSnapshot>(KEYS.universe);
+    if (cached && cached.day === today && cached.entries.length > 0) return cached;
+  }
+
+  const tickers = await fetchFuturesTickers();
+  const entries = rankUniverse(tickers, size);
 
   const snapshot: UniverseSnapshot = {
     day: today,

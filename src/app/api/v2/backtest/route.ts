@@ -2,13 +2,24 @@ import { NextResponse } from "next/server";
 import { runFuturesBacktest, type BacktestInput } from "@/lib/improve2/backtest";
 import { fetchFuturesKlines } from "@/lib/futures/rest";
 import { loadParams } from "@/lib/improve2/improve";
-import { resolveUniverse } from "@/lib/engine2/universe";
+import { UNIVERSE_SIZE, rankUniverse } from "@/lib/engine2/universe";
+import { fetchFuturesTickers } from "@/lib/futures/rest";
 import { kv } from "@/lib/store/kv";
 import type { Candle, Timeframe } from "@/lib/algo/types";
 
 /**
  * Replays the live strategy over recent real klines so the dashboard can show
  * what it would have done, not just what it is about to do.
+ *
+ * Two things keep the number honest, and both cost something:
+ *
+ *  - the symbol pool is wider than the ten the engine trades, and the
+ *    backtester re-ranks it by trailing volume at every step. Handing it
+ *    today's top ten instead would score the strategy only on the coins that
+ *    turned out to have the biggest month — reliably worth tens of percent it
+ *    could never have earned;
+ *  - the window is split at the parameters' `fittedThrough`, so the part the
+ *    search had already seen is reported separately from the part it had not.
  *
  * Cached, because a full replay costs several seconds and the answer only
  * changes as new bars close. The cache key includes the parameter version, so
@@ -19,6 +30,27 @@ export const dynamic = "force-dynamic";
 export const maxDuration = 60;
 
 const CACHE_TTL_SECONDS = 1800;
+
+/**
+ * How many symbols the replay ranks between.
+ *
+ * Wider than the live universe so the point-in-time ranking has losers to
+ * choose against, but every extra symbol is three more kline requests inside
+ * a 60s function, so it stops well short of the whole board.
+ */
+const POOL_SIZE = Number(process.env.BACKTEST_POOL_SIZE ?? "20");
+
+/** Headline figures for one slice of the replay. */
+interface Slice {
+  from: number;
+  to: number;
+  days: number;
+  totalReturn: number;
+  trades: number;
+  winRate: number;
+  profitFactor: number;
+  maxDrawdown: number;
+}
 
 interface CachedBacktest {
   paramsVersion: string;
@@ -39,6 +71,19 @@ interface CachedBacktest {
   bySymbol: { symbol: string; trades: number; netPnl: number }[];
   byReason: { reason: string; trades: number; netPnl: number }[];
   equityCurve: { t: number; equity: number }[];
+  /** Symbols ranked against each other, and how many could trade at once. */
+  poolSize: number;
+  universeSize: number;
+  /** Last moment of data the live parameters were fitted on. */
+  fittedThrough: number;
+  /** Days of this window that the parameter search had already seen. */
+  inSampleDays: number;
+  /**
+   * The part of the window after `fittedThrough`, replayed on its own.
+   * Null when the whole window is in-sample, which is the honest answer for
+   * freshly fitted parameters: there is no clean number to show yet.
+   */
+  outOfSample: Slice | null;
   recent: {
     symbol: string; side: string; entryPrice: number; exitPrice: number;
     netPnl: number; exitReason: string; closedAt: number;
@@ -65,8 +110,11 @@ export async function GET(request: Request) {
   }
 
   try {
-    const universe = await resolveUniverse();
-    const symbols = universe.entries.map((e) => e.symbol);
+    // Ranked here rather than through `resolveUniverse`, which caches into the
+    // key the live engine reads: a backtest asking for a wider pool must not
+    // hand the engine twenty symbols to trade.
+    const tickers = await fetchFuturesTickers();
+    const symbols = rankUniverse(tickers, POOL_SIZE).map((e) => e.symbol);
     const timeframes: Timeframe[] = ["15m", "1h", "4h"];
     // 1h bars for the window, plus headroom so indicators are warm at the start.
     const bars: Record<string, number> = {
@@ -99,12 +147,39 @@ export async function GET(request: Request) {
     const latest = Math.max(...stepAll.map((c) => c.closeTime));
     const from = latest - days * 86_400_000;
 
-    const result = runFuturesBacktest(data, stored.params, {
-      stepTimeframe: "1h",
-      startingBalance: Number(process.env.STARTING_BALANCE ?? "100"),
-      from,
-      to: latest,
-    });
+    const startingBalance = Number(process.env.STARTING_BALANCE ?? "100");
+    const replay = (windowFrom: number) =>
+      runFuturesBacktest(data, stored.params, {
+        stepTimeframe: "1h",
+        startingBalance,
+        from: windowFrom,
+        to: latest,
+        // Matches the live engine, which only ever trades the day's top N.
+        universeSize: UNIVERSE_SIZE,
+      });
+
+    const result = replay(from);
+
+    // The clean slice, when one exists. Replayed separately rather than
+    // sliced out of the full run, because an account that compounded through
+    // the in-sample months would enter the clean window with the wrong size.
+    const oosFrom = Math.max(from, stored.fittedThrough);
+    const outOfSample: Slice | null =
+      latest - oosFrom >= 5 * 86_400_000
+        ? (() => {
+            const r = replay(oosFrom);
+            return {
+              from: oosFrom,
+              to: latest,
+              days: Math.round((latest - oosFrom) / 86_400_000),
+              totalReturn: r.totalReturn,
+              trades: r.trades.length,
+              winRate: r.winRate,
+              profitFactor: r.profitFactor,
+              maxDrawdown: r.maxDrawdown,
+            };
+          })()
+        : null;
 
     const group = (keyOf: (t: (typeof result.trades)[number]) => string) => {
       const m = new Map<string, { trades: number; netPnl: number }>();
@@ -149,6 +224,14 @@ export async function GET(request: Request) {
       bySymbol: group((t) => t.symbol).map(([symbol, v]) => ({ symbol, ...v })),
       byReason: group((t) => t.exitReason).map(([reason, v]) => ({ reason, ...v })),
       equityCurve: equityCurve.slice(-200),
+      poolSize: data.length,
+      universeSize: UNIVERSE_SIZE,
+      fittedThrough: stored.fittedThrough,
+      inSampleDays: Math.max(
+        0,
+        Math.round((Math.min(latest, stored.fittedThrough) - from) / 86_400_000),
+      ),
+      outOfSample,
       recent: result.trades
         .slice()
         .sort((a, b) => b.closedAt - a.closedAt)

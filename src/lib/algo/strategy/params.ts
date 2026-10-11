@@ -152,6 +152,22 @@ export interface VersionedParams {
  * among those five, and 25 trades is a small sample — this is a starting
  * point for the improvement loop to beat, not a forecast.
  */
+/**
+ * The last moment of market data that influenced `DEFAULT_PARAMS`.
+ *
+ * Any backtest window overlapping this is in-sample: the parameters were
+ * chosen partly because of what happened in it, so a good score there is
+ * partly a measurement of the search, not of the strategy. The dashboard
+ * reads this to say which part of a window it is allowed to take seriously —
+ * without it, the natural thing to show is "the last 30 days", which for
+ * freshly fitted parameters is the one window guaranteed to flatter them.
+ *
+ * Set to the end of the test slice rather than of the training slice: the
+ * test window was unseen during the search, but it still picked the winner
+ * out of the five finalists, so it is not untouched either.
+ */
+export const DEFAULT_PARAMS_FITTED_THROUGH = Date.UTC(2026, 9, 10);
+
 export const DEFAULT_PARAMS: StrategyParams = {
   weights: {
     emaTrend: 2.04,
