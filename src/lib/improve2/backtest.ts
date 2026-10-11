@@ -7,7 +7,7 @@ import {
   type TimeframeAnalysis,
 } from "@/lib/algo/types";
 import { clamp, weightedAverage } from "@/lib/algo/util/math";
-import { commission, initialMargin, liquidationPrice } from "@/lib/futures/fees";
+import { commission, initialMargin, liquidationPrice, unrealisedPnl } from "@/lib/futures/fees";
 
 /**
  * Compact futures backtester used by the self-improvement loop.
@@ -199,6 +199,16 @@ export function runFuturesBacktest(
      * universe. Leave unset to trade everything passed in.
      */
     universeSize?: number;
+    /**
+     * Stop opening positions at this drawdown from peak equity, as the live
+     * engine does. Without it the backtest keeps sizing off a shrinking
+     * balance straight through a losing stretch that production would have
+     * sat out, and reports a drawdown deeper than the deployed strategy can
+     * reach.
+     */
+    maxDrawdownHalt?: number;
+    /** Notional ceiling as a multiple of equity, matching the risk manager. */
+    maxPositionFraction?: number;
   } = {},
 ): BacktestResult {
   const {
@@ -207,6 +217,8 @@ export function runFuturesBacktest(
     leverage = 3,
     riskPerTrade = 0.02,
     maxOpenPositions = Number(process.env.MAX_OPEN_POSITIONS ?? "3"),
+    maxDrawdownHalt = Number(process.env.MAX_DRAWDOWN ?? "0.3"),
+    maxPositionFraction = Number(process.env.MAX_POSITION_FRACTION ?? "1.5"),
     windowBars = 260,
   } = options;
 
@@ -266,10 +278,20 @@ export function runFuturesBacktest(
 
   let totalFees = 0;
   let totalFunding = 0;
+  // Equity as of the previous step's close, which is what a new position is
+  // sized against — the live engine sizes off marked equity, not free cash.
+  let equityNowRef = startingBalance;
 
-  // Latest close per symbol, refreshed as the clock advances; used to price
-  // the forced liquidation sweep if the account is wiped out.
-  const bySymbolStep = new Map<string, number[]>();
+  // Latest close per symbol, refreshed as the clock advances. Equity, the
+  // drawdown halt and the forced sweep all price against it, so it has to be
+  // written on every step — an earlier version declared it and never did,
+  // which quietly closed wiped-out positions at their entry price and so
+  // reported no loss on them at all.
+  const markBySymbol = new Map<string, number>();
+
+  // Set once the account hits `maxDrawdownHalt`; cleared after it recovers
+  // clearly, not on the first step back under, matching the live engine.
+  let halted = false;
 
   const close = (
     symbol: string,
@@ -338,6 +360,7 @@ export function runFuturesBacktest(
       const idx = lastClosedIndex(stepCandles, now, st.hints.get(stepTimeframe) ?? 0);
       st.hints.set(stepTimeframe, Math.max(0, idx));
       if (idx < 0) continue;
+      markBySymbol.set(d.symbol, (stepCandles[idx] as Candle).close);
       const nextBar = stepCandles[idx + 1];
       if (!nextBar) continue;
 
@@ -443,7 +466,7 @@ export function runFuturesBacktest(
       }
 
       // --- entry on the next bar's open ---
-      if (bankrupt) continue;
+      if (bankrupt || halted) continue;
       // Gates entries only: a position already open is managed to its exit
       // even if its symbol drops out of the ranking, which is what the live
       // engine does too.
@@ -467,8 +490,12 @@ export function runFuturesBacktest(
       if (!(stopDistance > 0) || !(price > 0)) continue;
       if (stopDistance / price > 0.9 / leverage) continue;
 
-      const equityNow = balance;
+      const equityNow = equityNowRef;
       let qty = (equityNow * riskPerTrade) / stopDistance;
+      // Notional ceiling, as the live risk manager applies it.
+      if (qty * price > equityNow * maxPositionFraction) {
+        qty = (equityNow * maxPositionFraction) / price;
+      }
       const margin = initialMargin(qty * price, leverage);
       if (margin > balance * 0.9) qty = (balance * 0.9 * leverage) / price;
       const notional = qty * price;
@@ -504,11 +531,30 @@ export function runFuturesBacktest(
       };
     }
 
-    // Track drawdown on realised balance plus posted margin.
+    /**
+     * Equity: free balance, plus each position's posted margin and whatever
+     * it is currently worth. Marking only balance plus margin — which this
+     * did before — hides an open loss until the position closes, so the
+     * drawdown it reported was always shallower than the account's.
+     */
     let marked = balance;
-    for (const st of state.values()) if (st.open) marked += st.open.margin;
+    for (const [sym, st] of state) {
+      if (!st.open) continue;
+      const mark = markBySymbol.get(sym) ?? st.open.entry;
+      marked +=
+        st.open.margin +
+        unrealisedPnl({ side: st.open.side, entryPrice: st.open.entry, quantity: st.open.qty, markPrice: mark });
+    }
+    equityNowRef = Math.max(0, marked);
     peak = Math.max(peak, marked);
     if (peak > 0) maxDrawdown = Math.max(maxDrawdown, (peak - marked) / peak);
+
+    // The live engine stops opening positions here and only resumes once the
+    // account has recovered clearly, rather than on the first step back under
+    // the threshold.
+    const dd = peak > 0 ? (peak - marked) / peak : 0;
+    if (dd >= maxDrawdownHalt) halted = true;
+    else if (halted && dd < maxDrawdownHalt * 0.8) halted = false;
 
     // A real account stops here: margin call, everything closed, no more
     // trading. Letting the balance run negative produced returns beyond -100%,
@@ -517,8 +563,7 @@ export function runFuturesBacktest(
       bankrupt = true;
       for (const [sym, st] of state) {
         if (!st.open) continue;
-        const last = (bySymbolStep.get(sym) ?? [])[0];
-        close(sym, st, last ?? st.open.entry, "liquidation", 1, now);
+        close(sym, st, markBySymbol.get(sym) ?? st.open.entry, "liquidation", 1, now);
       }
       balance = Math.max(0, balance);
     }

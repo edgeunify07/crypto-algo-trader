@@ -120,3 +120,43 @@ describe("runFuturesBacktest universe gate", () => {
     expect(wide.totalReturn).toBeCloseTo(open.totalReturn, 10);
   });
 });
+
+describe("runFuturesBacktest risk limits", () => {
+  /** Choppy enough to lose, so a drawdown halt has something to stop. */
+  const choppy = (bars: number, seed: number) =>
+    series(
+      bars,
+      () => 1_000,
+      (i) => 100 * (1 + 0.05 * Math.sin((i + seed) / 11) + 0.02 * Math.sin((i + seed) / 3)),
+    );
+
+  it("stops opening positions once drawdown passes the halt", () => {
+    const data = [input("A", choppy(700, 0)), input("B", choppy(700, 17))];
+    const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
+
+    const unhalted = runFuturesBacktest(data, DEFAULT_PARAMS, { ...common, maxDrawdownHalt: 1 });
+    const halted = runFuturesBacktest(data, DEFAULT_PARAMS, { ...common, maxDrawdownHalt: 0.02 });
+
+    // Guards against a vacuous pass: the run has to lose enough to trip a 2%
+    // halt, and to have kept trading without one.
+    expect(unhalted.maxDrawdown).toBeGreaterThan(0.02);
+    expect(halted.trades.length).toBeLessThan(unhalted.trades.length);
+  });
+
+  it("caps a position's notional at the configured multiple of equity", () => {
+    const data = [input("A", choppy(500, 0))];
+    const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
+
+    const capped = runFuturesBacktest(data, DEFAULT_PARAMS, {
+      ...common,
+      maxPositionFraction: 0.25,
+    });
+    for (const t of capped.trades) {
+      // Entry notional, against the equity the account could have held at
+      // its very best — a looser bound than the real one, but one that a
+      // missing cap still breaks.
+      expect(t.quantity * t.entryPrice).toBeLessThanOrEqual(100 * 0.25 * 3);
+    }
+    expect(capped.trades.length).toBeGreaterThan(0);
+  });
+});
