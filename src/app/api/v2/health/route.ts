@@ -93,6 +93,32 @@ export async function GET() {
     problems.push("OPENROUTER_API_KEY is unset — trading runs, but the strategy will never self-improve.");
   }
 
+  /**
+   * Nothing is driving the loop.
+   *
+   * This is the failure that looks least like a failure: every panel renders,
+   * the deployment is green, and the engine simply never runs. Two things can
+   * drive it and both have quiet ways to be absent — nobody has the dashboard
+   * open, and the scheduled workflow only fires from the repository's
+   * *default* branch, so a `tick.yml` that lives on a feature branch has
+   * never run once. Naming both beats an "idle" badge with no explanation.
+   */
+  const ticks = account?.tickCount ?? 0;
+  const lastTickAt = account?.lastTickAt ?? 0;
+  const sinceTick = lastTickAt ? Date.now() - lastTickAt : Infinity;
+  if (store.isDurable && (ticks === 0 || sinceTick > 15 * 60_000)) {
+    const how =
+      ticks === 0
+        ? "The engine has never ticked."
+        : `The engine last ticked ${Math.round(sinceTick / 60_000)} minutes ago.`;
+    problems.push(
+      `${how} It advances once per request to /api/v2/tick: from this dashboard while it is open, ` +
+        "and otherwise from a scheduler. Check that .github/workflows/tick.yml is on the repository's " +
+        "default branch — GitHub only runs schedules from there — and that the APP_URL and CRON_SECRET " +
+        "repository secrets are set.",
+    );
+  }
+
   return NextResponse.json(
     {
       ok: problems.length === 0,

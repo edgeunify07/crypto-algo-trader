@@ -56,7 +56,11 @@ If Binance turns out to be unreachable from whatever region your deployment land
      | `APP_URL` | `https://your-app.vercel.app` (no trailing slash) |
      | `CRON_SECRET` | the same value you set in Vercel |
 
+     > **The workflow file has to be on the repository's default branch.** GitHub runs `schedule:` triggers from the default branch only — from any other branch it is never scheduled, never appears under **Actions**, and reports no error anywhere. A `tick.yml` sitting on a feature branch has simply never run, which on the dashboard looks like an engine that went idle for no reason. Merge the branch, or change the default under **Settings → General → Default branch**.
+
      Then open the **Actions** tab and enable workflows. GitHub runs schedules on a best-effort basis, so a run can be a few minutes late; the tick is idempotent and lock-protected, so a late or doubled run is harmless. GitHub also disables schedules after 60 days of repository inactivity — push a commit or hit "Run workflow" to re-arm.
+
+     To check: the **Actions** tab should list a `tick` workflow with recent runs. If the tab is empty, the file is not on the default branch. `/api/v2/health` says the same thing whenever the engine has not ticked for fifteen minutes.
 
    On Vercel Pro you can skip the Action: change the `vercel.json` cron to `* * * * *`.
 
