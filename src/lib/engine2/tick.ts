@@ -582,6 +582,29 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
   if (!options.manageOnly && !account.haltedReason) {
     const info = await fetchFuturesExchangeInfo().catch(() => new Map());
 
+    /**
+     * Record why a candidate that passed the signal checks still did not
+     * trade.
+     *
+     * The screener runs before any sizing, so its gate list only covers
+     * signal quality — and the dashboard, reading that list, told people
+     * "all entry conditions met, trades on the next tick" about symbols this
+     * loop then rejected for a reason it never mentioned. The promise never
+     * came true and nothing said why.
+     *
+     * Rather than recompute the sizing rules in the screener, where they
+     * could drift out of step with these, the code that makes the decision
+     * records it: every rejection below adds the real reason to that
+     * symbol's row.
+     */
+    const rowBySymbol = new Map(screener.map((r) => [r.symbol, r]));
+    const reject = (symbol: string, name: string, required: string, actual: string) => {
+      const row = rowBySymbol.get(symbol);
+      if (!row) return;
+      row.gates.push({ name, required, actual, passed: false });
+      row.blockedBy = name;
+    };
+
     const ranked = screener
       .filter((r) => !r.hasPosition && r.direction !== "flat")
       .filter((r) => symbols.includes(r.symbol)) // only today's top-N
@@ -592,7 +615,16 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       );
 
     for (const row of ranked) {
-      if (positions.length >= limits.maxOpenPositions) break;
+      if (positions.length >= limits.maxOpenPositions) {
+        // Everything still queued is waiting for a slot, not for a signal.
+        reject(
+          row.symbol,
+          "free position slot",
+          `under ${limits.maxOpenPositions} open`,
+          `${positions.length} open`,
+        );
+        continue;
+      }
 
       const blended = analyses.get(row.symbol);
       const anchor = blended?.anchor;
@@ -617,14 +649,35 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       }
 
       const mark = markBySymbol[row.symbol];
-      if (!(mark > 0) || !(anchor.atr > 0)) continue;
+      if (!(mark > 0) || !(anchor.atr > 0)) {
+        reject(row.symbol, "market data", "a mark price and ATR", "missing");
+        continue;
+      }
 
       // Stop from ATR, then sized so the stop costs exactly riskPerTrade.
       const stopDistance = anchor.atr * params.exit.atrStopMultiple;
       const stopLoss = side === "long" ? mark - stopDistance : mark + stopDistance;
-      if (!(stopDistance > 0)) continue;
-      // A stop wider than the liquidation distance would never be reached.
-      if (stopDistance / mark > 0.9 / limits.leverage) continue;
+      if (!(stopDistance > 0)) {
+        reject(row.symbol, "stop distance", "above zero", "zero");
+        continue;
+      }
+      /**
+       * A stop wider than the liquidation distance would never be reached —
+       * the position is wiped out first — so the trade is not takeable at
+       * this leverage. On a volatile small-cap with a 4h anchor this is the
+       * usual reason a symbol passes every signal check and still never
+       * trades, which is worth saying out loud rather than skipping.
+       */
+      const stopRoom = 0.9 / limits.leverage;
+      if (stopDistance / mark > stopRoom) {
+        reject(
+          row.symbol,
+          "stop fits leverage",
+          `under ${(stopRoom * 100).toFixed(0)}% of price`,
+          `${((stopDistance / mark) * 100).toFixed(1)}%`,
+        );
+        continue;
+      }
 
       const riskCapital = currentEquity * limits.riskPerTrade;
       let quantity = riskCapital / stopDistance;
@@ -649,12 +702,26 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         notes.push(
           `${row.symbol}: skipped — size ${notional.toFixed(2)} USDT is below the ${minNotional} minimum`,
         );
+        reject(
+          row.symbol,
+          "size above exchange minimum",
+          `${minNotional} USDT`,
+          `${notional.toFixed(2)} USDT`,
+        );
         continue;
       }
 
       const margin = initialMargin(notional, limits.leverage);
       const entryFee = commission(notional, "taker");
-      if (margin + entryFee > account.balance) continue;
+      if (margin + entryFee > account.balance) {
+        reject(
+          row.symbol,
+          "margin available",
+          `${(margin + entryFee).toFixed(2)} USDT`,
+          `${account.balance.toFixed(2)} USDT free`,
+        );
+        continue;
+      }
 
       account.balance -= margin + entryFee;
       account.totalFees += entryFee;

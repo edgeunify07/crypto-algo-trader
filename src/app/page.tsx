@@ -136,6 +136,8 @@ interface State {
 
 const TF_ORDER = ["5m", "15m", "1h", "4h", "1d"];
 const TICK_MS = 20_000;
+/** How often server-side prices are pulled when the socket is unavailable. */
+const PRICE_MS = 3_000;
 
 const money = (n: number, d = 2) =>
   `${n < 0 ? "-" : ""}$${Math.abs(n).toFixed(d)}`;
@@ -178,6 +180,26 @@ export default function Home() {
     env?: Record<string, boolean>;
     problems?: string[];
   } | null>(null);
+  /**
+   * Prices from the server, for browsers the exchange's socket cannot reach.
+   *
+   * Binance restricts its stream by region, and where it is blocked the
+   * socket connects and then says nothing — so every price on the page sits
+   * still between engine ticks, five minutes apart. This poll is the floor
+   * under that: slower than the socket and it costs an invocation each time,
+   * but it moves, which the socket does not everywhere.
+   */
+  const [serverPrices, setServerPrices] = useState<Record<string, number>>({});
+  /**
+   * Whether the socket is currently delivering, read inside the poll.
+   *
+   * A ref rather than a dependency: putting it in the poll's closure would
+   * rebuild the callback every time the feed flickered, tearing down and
+   * recreating the timers that drive the whole page.
+   */
+  const socketLive = useRef(false);
+  /** The symbols on screen, so the poll asks for those and not all 927. */
+  const watchRef = useRef<string[]>([]);
   const inFlight = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -196,6 +218,27 @@ export default function Home() {
       setError(null);
     } catch {
       setError("Cannot reach the server");
+    }
+  }, []);
+
+  /**
+   * Pull prices from the server.
+   *
+   * Skipped entirely while the socket is delivering — paying for a poll to
+   * learn something already arriving seven times a second would be waste.
+   */
+  const pullPrices = useCallback(async () => {
+    if (socketLive.current) return;
+    const wanted = watchRef.current;
+    if (wanted.length === 0) return;
+    try {
+      const res = await fetch(`/api/v2/prices?symbols=${wanted.join(",")}`, {
+        cache: "no-store",
+      });
+      const body = (await res.json()) as { prices?: Record<string, number> };
+      if (body.prices) setServerPrices(body.prices);
+    } catch {
+      // The socket or the per-tick screener still carries a price.
     }
   }, []);
 
@@ -234,9 +277,13 @@ export default function Home() {
       setNow(Date.now());
       void refresh();
       void tick();
+      // Deferred with the rest: the first price pull is a setState too, and
+      // run inline it is the same cascading render React rejects.
+      void pullPrices();
     }, 0);
     const t = setInterval(() => void tick(), TICK_MS);
     const r = setInterval(() => void refresh(), 7000);
+    const priceTimer = setInterval(() => void pullPrices(), PRICE_MS);
     const clock = setInterval(() => setNow(Date.now()), 1000);
     // Catch up immediately when the app comes back to the foreground on iOS.
     const onVisible = () => {
@@ -247,10 +294,11 @@ export default function Home() {
       clearTimeout(kick);
       clearInterval(t);
       clearInterval(r);
+      clearInterval(priceTimer);
       clearInterval(clock);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [tick, refresh]);
+  }, [tick, refresh, pullPrices]);
 
   /**
    * Which symbol the terminal is showing.
@@ -275,6 +323,9 @@ export default function Home() {
   // Live market data straight from the exchange. The polled book stays as a
   // fallback for anywhere the socket cannot reach.
   const watchlist = rows.length > 0 ? rows.map((r) => r.symbol) : [symbol];
+  // Stable across polls that return the same symbols, so the effect below
+  // does not rewrite the ref on every refresh.
+  const watchKey = watchlist.join(",");
   const stream = useBinanceStream(symbol, chartTf, watchlist);
   const polled = useBook(symbol);
 
@@ -313,9 +364,18 @@ export default function Home() {
   // "Live" only when the socket is actually delivering price, not merely open.
   const streaming = stream.connected && (stream.feeds.book || stream.feeds.kline);
 
+  // Mirrored into refs so the price poll can read them without re-subscribing
+  // and tearing down the timers that drive the page.
+  useEffect(() => {
+    socketLive.current = stream.feeds.book;
+  }, [stream.feeds.book]);
+  useEffect(() => {
+    watchRef.current = watchKey.split(",").filter(Boolean);
+  }, [watchKey]);
+
   const marketRows = rows.map((r) => ({
     symbol: r.symbol,
-    markPrice: stream.prices[r.symbol]?.price ?? r.markPrice,
+    markPrice: stream.prices[r.symbol]?.price ?? serverPrices[r.symbol] ?? r.markPrice,
     changePct: stream.prices[r.symbol]?.changePct,
     score: r.score,
     direction: r.direction,
@@ -624,7 +684,7 @@ function ChartSwitch({
         </span>
       </div>
       {source === "tradingview" ? (
-        <TradingViewChart symbol={symbol} timeframe={timeframe} onTimeframe={onTimeframe} />
+        <TradingViewChart symbol={symbol} timeframe={timeframe} />
       ) : (
         <Chart
           symbol={symbol}
@@ -890,6 +950,12 @@ function ScanTab({
     <>
       {rows.map((r) => {
         const open = expanded === r.symbol;
+        // The engine names its own blocker; fall back to the first failing
+        // gate so a row is never silent about why it is not trading.
+        const blocker =
+          r.gates.find((g) => g.name === r.blockedBy && !g.passed) ??
+          r.gates.find((g) => !g.passed) ??
+          null;
         return (
           <div key={r.symbol} className="rounded-xl bg-[var(--surface)] overflow-hidden">
             <button
@@ -931,16 +997,26 @@ function ScanTab({
                   fund {(r.fundingRate * 100).toFixed(4)}%
                 </span>
               </div>
+              {/*
+                The failing check with its numbers, not just its name. The
+                engine records the real reason a candidate was passed over —
+                including the sizing and leverage rules that used to reject
+                silently while this row still promised a trade.
+              */}
               <div className="mt-1 text-[9px]">
                 {r.hasPosition ? (
-                  <span className="text-[var(--accent)]">position open</span>
-                ) : r.blockedBy ? (
+                  <span className="text-[var(--accent)]">position open — managing it</span>
+                ) : blocker ? (
                   <span className="text-[var(--muted)]">
-                    waiting on: <span className="text-[var(--warn)]">{r.blockedBy}</span>
+                    <span className="text-[var(--down)]">✕</span>{" "}
+                    <span className="text-[var(--warn)]">{blocker.name}</span>{" "}
+                    <span className="tnum text-[var(--text)]">{blocker.actual}</span>
+                    {" · needs "}
+                    <span className="tnum">{blocker.required}</span>
                   </span>
                 ) : (
                   <span className="text-[var(--up)]">
-                    all entry conditions met — trades on the next tick
+                    every check passes — opens on the next run
                   </span>
                 )}
               </div>
