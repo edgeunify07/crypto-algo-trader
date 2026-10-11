@@ -12,6 +12,31 @@ set -a && . ./.env.local && set +a
 OUT=/tmp/research npx tsx tools/research/validate.mts
 ```
 
+## `optimise2.mts`
+
+Two-stage search validated across four disjoint out-of-sample windows.
+
+The earlier approach searched 60 days and validated on one 21-day window,
+which is thin: run 400 trials against any single window and something will
+look good on it by luck. This trains on the oldest 35% of 150 days, then
+re-runs the survivors across four later windows on the full universe, and
+accepts a candidate only if it stayed profitable in at least three of them
+with no liquidations. Ranking is by median window return rather than mean, so
+one outlier cannot carry a candidate that is otherwise mediocre.
+
+Half the trials refine around the best point found so far instead of sampling
+freely, which is what makes a random search converge rather than just sprawl.
+
+```bash
+set -a && . ./.env.local && set +a
+OUT=/tmp/research TRIALS=600 KEEP=40 DAYS=150 npx tsx tools/research/optimise2.mts
+```
+
+Writes `$OUT/winner2.json` when something clears the bar, and says so plainly
+when nothing does — in which case the shipped defaults stay, because a
+candidate that only works on the window it was chosen for is worse than no
+change at all.
+
 ## `validate.mts`
 
 Third-window validation. The optimiser ranks candidates with a score that
