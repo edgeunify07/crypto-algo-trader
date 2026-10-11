@@ -511,7 +511,12 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       const reached = position.side === "long" ? mark >= tp.price : mark <= tp.price;
       if (reached) {
         tp.hit = true;
-        closePosition(position, tp.price, "take_profit", tp.fraction);
+        closePosition(
+          position,
+          tp.price,
+          position.scalp ? "scalp_target" : "take_profit",
+          tp.fraction,
+        );
       }
     }
     if (position.quantity <= 1e-12) continue;
@@ -531,7 +536,18 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
             ? Math.max(nextStop, position.entryPrice)
             : Math.min(nextStop, position.entryPrice);
       }
-      if (params.exit.trailStartR > 0 && rEarned >= params.exit.trailStartR && atr > 0) {
+      /**
+       * Trailing is skipped on a scalp. A trail measured in ATR multiples
+       * sits well inside a fixed percentage target, so it would reliably cut
+       * the trade short of the one exit it was opened for. Break-even below
+       * still applies — that can never take less than the entry.
+       */
+      if (
+        !position.scalp &&
+        params.exit.trailStartR > 0 &&
+        rEarned >= params.exit.trailStartR &&
+        atr > 0
+      ) {
         const trail =
           position.side === "long"
             ? position.extreme - atr * params.exit.trailAtrMultiple
@@ -560,8 +576,9 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     const barsHeld = Math.floor(
       (now - position.openedAt) / TIMEFRAME_MS[position.timeframe],
     );
-    if (barsHeld >= params.exit.maxHoldBars) {
-      closePosition(position, mark, "max_hold", 1);
+    const holdLimit = position.scalp ? params.scalp.maxHoldBars : params.exit.maxHoldBars;
+    if (barsHeld >= holdLimit) {
+      closePosition(position, mark, position.scalp ? "scalp_timeout" : "max_hold", 1);
     }
   }
   positions = positions.filter((p) => p.quantity > 1e-12);
@@ -654,8 +671,19 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         continue;
       }
 
+      /**
+       * A scalp when the blend is unusually sure: tighter stop, a fixed
+       * percentage target and a short clock. The tighter stop is not a
+       * detail — keeping the swing stop would size the position down to hold
+       * the same risk over a move the scalp only needs a fraction of, and the
+       * trade would never clear its own fees.
+       */
+      const isScalp =
+        params.scalp.enabled && blended.confidence >= params.scalp.minConfidence;
+
       // Stop from ATR, then sized so the stop costs exactly riskPerTrade.
-      const stopDistance = anchor.atr * params.exit.atrStopMultiple;
+      const stopDistance =
+        anchor.atr * (isScalp ? params.scalp.atrStopMultiple : params.exit.atrStopMultiple);
       const stopLoss = side === "long" ? mark - stopDistance : mark + stopDistance;
       if (!(stopDistance > 0)) {
         reject(row.symbol, "stop distance", "above zero", "zero");
@@ -726,13 +754,26 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       account.balance -= margin + entryFee;
       account.totalFees += entryFee;
 
-      const takeProfits = params.exit.takeProfitRMultiples
-        .map((r, i) => ({
-          price: side === "long" ? mark + stopDistance * r : mark - stopDistance * r,
-          fraction: params.exit.takeProfitFractions[i] ?? 0,
-          hit: false,
-        }))
-        .filter((tp) => tp.fraction > 0);
+      const takeProfits = isScalp
+        ? [
+            {
+              // The whole position at a fixed move: "take the 5% and close",
+              // not a ladder that leaves a runner behind.
+              price:
+                side === "long"
+                  ? mark * (1 + params.scalp.targetPct)
+                  : mark * (1 - params.scalp.targetPct),
+              fraction: 1,
+              hit: false,
+            },
+          ]
+        : params.exit.takeProfitRMultiples
+            .map((r, i) => ({
+              price: side === "long" ? mark + stopDistance * r : mark - stopDistance * r,
+              fraction: params.exit.takeProfitFractions[i] ?? 0,
+              hit: false,
+            }))
+            .filter((tp) => tp.fraction > 0);
 
       const position: FuturesPosition = {
         id: newId("p"),
@@ -757,10 +798,14 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         fundingPaid: 0,
         lastFundingAt: now,
         timeframe: anchor.timeframe,
-        style: STYLE_BY_TIMEFRAME[anchor.timeframe] ?? "swing",
+        style: isScalp ? "scalp" : (STYLE_BY_TIMEFRAME[anchor.timeframe] ?? "swing"),
+        scalp: isScalp,
         paramsVersion,
         reasons: [
-          `${side} ${row.symbol} ${anchor.timeframe} (${STYLE_BY_TIMEFRAME[anchor.timeframe] ?? "swing"})`,
+          isScalp
+            ? `${side} ${row.symbol} scalp — confidence ${(blended.confidence * 100).toFixed(0)}%, ` +
+              `target ${(params.scalp.targetPct * 100).toFixed(1)}%, out within ${params.scalp.maxHoldBars} bars`
+            : `${side} ${row.symbol} ${anchor.timeframe} (${STYLE_BY_TIMEFRAME[anchor.timeframe] ?? "swing"})`,
           `score ${blended.score.toFixed(2)}, alignment ${(blended.alignment * 100).toFixed(0)}%, ${anchor.regime.kind}`,
           `Elliott ${anchor.elliott.pattern}/${anchor.elliott.currentWave} bias ${anchor.elliott.bias} (${(anchor.elliott.confidence * 100).toFixed(0)}%)`,
           `Gann ${anchor.gann.bias}, bar ${anchor.gann.timeCycle.barsSinceAnchor} of ${anchor.gann.timeCycle.nearestCycle} cycle`,

@@ -77,7 +77,7 @@ function lastClosedIndex(candles: Candle[], time: number, hint: number): number 
   return i - 1;
 }
 
-function aggregate(
+export function aggregate(
   perTimeframe: Map<Timeframe, TimeframeAnalysis>,
   params: StrategyParams,
 ) {
@@ -243,6 +243,8 @@ export function runFuturesBacktest(
     openedAt: number;
     lastFundingAt: number;
     timeframe: Timeframe;
+    /** Opened as a high-conviction scalp: fixed target, short clock. */
+    scalp: boolean;
   }
 
   // The clock is restricted to the requested window, but the analysis windows
@@ -412,7 +414,14 @@ export function runFuturesBacktest(
             open.side === "long" ? nextBar.high >= tp.price : nextBar.low <= tp.price;
           if (reached) {
             tp.hit = true;
-            close(d.symbol, st, tp.price, "take_profit", tp.fraction, nextBar.closeTime);
+            close(
+              d.symbol,
+              st,
+              tp.price,
+              open.scalp ? "scalp_target" : "take_profit",
+              tp.fraction,
+              nextBar.closeTime,
+            );
           }
         }
         if (!st.open) continue;
@@ -440,7 +449,19 @@ export function runFuturesBacktest(
           if (params.exit.breakEvenR > 0 && r >= params.exit.breakEvenR) {
             next = open.side === "long" ? Math.max(next, open.entry) : Math.min(next, open.entry);
           }
-          if (params.exit.trailStartR > 0 && r >= params.exit.trailStartR && anchor.atr > 0) {
+          /**
+           * Trailing is a swing exit and it is skipped on a scalp: a trail
+           * set in ATR multiples sits well inside a fixed 5% target, so it
+           * would reliably cut the trade short of the only exit it was
+           * opened for. Break-even still applies — that one cannot take less
+           * than the entry.
+           */
+          if (
+            !open.scalp &&
+            params.exit.trailStartR > 0 &&
+            r >= params.exit.trailStartR &&
+            anchor.atr > 0
+          ) {
             const trail =
               open.side === "long"
                 ? open.extreme - anchor.atr * params.exit.trailAtrMultiple
@@ -459,8 +480,9 @@ export function runFuturesBacktest(
           continue;
         }
         const barsHeld = Math.floor((now - open.openedAt) / TIMEFRAME_MS[open.timeframe]);
-        if (barsHeld >= params.exit.maxHoldBars) {
-          close(d.symbol, st, nextBar.close, "max_hold", 1, nextBar.closeTime);
+        const holdLimit = open.scalp ? params.scalp.maxHoldBars : params.exit.maxHoldBars;
+        if (barsHeld >= holdLimit) {
+          close(d.symbol, st, nextBar.close, open.scalp ? "scalp_timeout" : "max_hold", 1, nextBar.closeTime);
         }
         continue;
       }
@@ -486,7 +508,18 @@ export function runFuturesBacktest(
       if (params.entry.requireGannAgreement && anchor.gann.bias !== side) continue;
 
       const price = nextBar.open;
-      const stopDistance = anchor.atr * params.exit.atrStopMultiple;
+      /**
+       * A scalp when the blend is unusually sure. It takes a tighter stop as
+       * well as a fixed target: keeping the swing stop would size the
+       * position down to hold the same risk over a move it only needs a
+       * fraction of, and the trade would never pay for its fees.
+       */
+      const isScalp =
+        params.scalp.enabled && blended.confidence >= params.scalp.minConfidence;
+      const stopMultiple = isScalp
+        ? params.scalp.atrStopMultiple
+        : params.exit.atrStopMultiple;
+      const stopDistance = anchor.atr * stopMultiple;
       if (!(stopDistance > 0) || !(price > 0)) continue;
       if (stopDistance / price > 0.9 / leverage) continue;
 
@@ -514,13 +547,26 @@ export function runFuturesBacktest(
         entry: price,
         margin: realMargin,
         stop: side === "long" ? price - stopDistance : price + stopDistance,
-        targets: params.exit.takeProfitRMultiples
-          .map((r, i) => ({
-            price: side === "long" ? price + stopDistance * r : price - stopDistance * r,
-            fraction: params.exit.takeProfitFractions[i] ?? 0,
-            hit: false,
-          }))
-          .filter((t) => t.fraction > 0),
+        targets: isScalp
+          ? [
+              {
+                // The whole position, at a fixed move — "close it" rather
+                // than a ladder that leaves a runner behind.
+                price:
+                  side === "long"
+                    ? price * (1 + params.scalp.targetPct)
+                    : price * (1 - params.scalp.targetPct),
+                fraction: 1,
+                hit: false,
+              },
+            ]
+          : params.exit.takeProfitRMultiples
+              .map((r, i) => ({
+                price: side === "long" ? price + stopDistance * r : price - stopDistance * r,
+                fraction: params.exit.takeProfitFractions[i] ?? 0,
+                hit: false,
+              }))
+              .filter((t) => t.fraction > 0),
         liq: liquidationPrice({ side, entryPrice: price, quantity: qty, leverage, symbol: d.symbol }),
         extreme: price,
         entryFee,
@@ -528,6 +574,7 @@ export function runFuturesBacktest(
         openedAt: nextBar.closeTime,
         lastFundingAt: nextBar.closeTime,
         timeframe: anchor.timeframe,
+        scalp: isScalp,
       };
     }
 

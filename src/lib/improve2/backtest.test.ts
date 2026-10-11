@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { pointInTimeUniverse, runFuturesBacktest, type BacktestInput } from "./backtest";
-import { DEFAULT_PARAMS } from "@/lib/algo/strategy/params";
+import { DEFAULT_PARAMS, type StrategyParams } from "@/lib/algo/strategy/params";
 import type { Candle, Timeframe } from "@/lib/algo/types";
 
 const HOUR = 3_600_000;
@@ -32,6 +32,30 @@ function series(bars: number, volumeAt: (i: number) => number, priceAt: (i: numb
 function input(symbol: string, candles: Candle[]): BacktestInput {
   return { symbol, byTimeframe: new Map<Timeframe, Candle[]>([["1h", candles]]) };
 }
+
+/**
+ * Entry thresholds loose enough that a synthetic series actually trades.
+ *
+ * These tests are about mechanics — the universe gate, the drawdown halt,
+ * what a scalp does once taken — not about how the live strategy happens to
+ * be tuned. Running them on `DEFAULT_PARAMS` tied them to that tuning, and
+ * they duly went silent the first time it was retuned to require Gann
+ * agreement: every assertion still passed except the ones checking a trade
+ * had happened at all, which is the worst way for a test to fail.
+ */
+const TRADES_READILY: StrategyParams = {
+  ...DEFAULT_PARAMS,
+  entry: {
+    ...DEFAULT_PARAMS.entry,
+    minScore: 0.15,
+    minConfidence: 0.15,
+    minAlignment: 0.2,
+    requireElliottAgreement: false,
+    requireGannAgreement: false,
+    avoidGannTimeCycle: false,
+  },
+  scalp: { ...DEFAULT_PARAMS.scalp, enabled: false },
+};
 
 describe("pointInTimeUniverse", () => {
   const clockOf = (candles: Candle[]) => candles.map((c) => c.closeTime);
@@ -90,11 +114,11 @@ describe("runFuturesBacktest universe gate", () => {
       input("POOR", trend(bars, 3).map((c) => ({ ...c, quoteVolume: 100 }))),
     ];
 
-    const ungated = runFuturesBacktest(data, DEFAULT_PARAMS, {
+    const ungated = runFuturesBacktest(data, TRADES_READILY, {
       stepTimeframe: "1h",
       startingBalance: 100,
     });
-    const gated = runFuturesBacktest(data, DEFAULT_PARAMS, {
+    const gated = runFuturesBacktest(data, TRADES_READILY, {
       stepTimeframe: "1h",
       startingBalance: 100,
       universeSize: 1,
@@ -107,11 +131,11 @@ describe("runFuturesBacktest universe gate", () => {
 
   it("is a no-op when the universe is wider than the pool", () => {
     const data = [input("A", trend(400, 0)), input("B", trend(400, 5))];
-    const open = runFuturesBacktest(data, DEFAULT_PARAMS, {
+    const open = runFuturesBacktest(data, TRADES_READILY, {
       stepTimeframe: "1h",
       startingBalance: 100,
     });
-    const wide = runFuturesBacktest(data, DEFAULT_PARAMS, {
+    const wide = runFuturesBacktest(data, TRADES_READILY, {
       stepTimeframe: "1h",
       startingBalance: 100,
       universeSize: 10,
@@ -134,8 +158,8 @@ describe("runFuturesBacktest risk limits", () => {
     const data = [input("A", choppy(700, 0)), input("B", choppy(700, 17))];
     const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
 
-    const unhalted = runFuturesBacktest(data, DEFAULT_PARAMS, { ...common, maxDrawdownHalt: 1 });
-    const halted = runFuturesBacktest(data, DEFAULT_PARAMS, { ...common, maxDrawdownHalt: 0.02 });
+    const unhalted = runFuturesBacktest(data, TRADES_READILY, { ...common, maxDrawdownHalt: 1 });
+    const halted = runFuturesBacktest(data, TRADES_READILY, { ...common, maxDrawdownHalt: 0.02 });
 
     // Guards against a vacuous pass: the run has to lose enough to trip a 2%
     // halt, and to have kept trading without one.
@@ -147,7 +171,7 @@ describe("runFuturesBacktest risk limits", () => {
     const data = [input("A", choppy(500, 0))];
     const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
 
-    const capped = runFuturesBacktest(data, DEFAULT_PARAMS, {
+    const capped = runFuturesBacktest(data, TRADES_READILY, {
       ...common,
       maxPositionFraction: 0.25,
     });
@@ -158,5 +182,64 @@ describe("runFuturesBacktest risk limits", () => {
       expect(t.quantity * t.entryPrice).toBeLessThanOrEqual(100 * 0.25 * 3);
     }
     expect(capped.trades.length).toBeGreaterThan(0);
+  });
+});
+
+describe("runFuturesBacktest scalp rule", () => {
+  /** A clean rising series, so a long that is opened will reach its target. */
+  const rising = (bars: number) =>
+    series(bars, () => 1_000, (i) => 100 * (1 + 0.004 * i + 0.015 * Math.sin(i / 9)));
+
+  /**
+   * Confidence never reaches 0.8 in practice, so these drive the rule from a
+   * threshold low enough to fire. The behaviour under test is what a scalp
+   * does once taken, not how often the blend is sure.
+   */
+  const withScalp = (over: Partial<typeof DEFAULT_PARAMS.scalp>) => ({
+    ...TRADES_READILY,
+    scalp: { ...DEFAULT_PARAMS.scalp, enabled: true, minConfidence: 0.1, ...over },
+  });
+
+  const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
+  const data = [input("A", rising(600)), input("B", rising(600).slice(40))];
+
+  it("closes the whole position at the configured move", () => {
+    const r = runFuturesBacktest(data, withScalp({ targetPct: 0.03 }), common);
+    const hits = r.trades.filter((t) => t.exitReason === "scalp_target");
+    expect(hits.length).toBeGreaterThan(0);
+    for (const t of hits) {
+      // Filled at the target, so the move is the configured one either way.
+      const move = t.side === "long"
+        ? (t.exitPrice - t.entryPrice) / t.entryPrice
+        : (t.entryPrice - t.exitPrice) / t.entryPrice;
+      expect(move).toBeCloseTo(0.03, 6);
+    }
+  });
+
+  it("gives up on its own clock, not the swing one", () => {
+    // Far enough away that the clock runs out first.
+    const r = runFuturesBacktest(data, withScalp({ targetPct: 0.45, maxHoldBars: 6 }), common);
+    const timeouts = r.trades.filter((t) => t.exitReason === "scalp_timeout");
+    expect(timeouts.length).toBeGreaterThan(0);
+    // The swing limit is far longer, so nothing should exit under its name.
+    expect(r.trades.some((t) => t.exitReason === "max_hold")).toBe(false);
+  });
+
+  it("does nothing when disabled", () => {
+    const off = runFuturesBacktest(data, TRADES_READILY, common);
+    expect(off.trades.some((t) => t.exitReason.startsWith("scalp_"))).toBe(false);
+  });
+
+  it("leaves the swing book alone at a threshold confidence never reaches", () => {
+    // The shipped default. Confidence topped out at 0.858 over 120 days and
+    // 24 symbols, so on this synthetic series it must not fire at all.
+    const shipped = runFuturesBacktest(
+      data,
+      { ...TRADES_READILY, scalp: DEFAULT_PARAMS.scalp },
+      common,
+    );
+    const off = runFuturesBacktest(data, TRADES_READILY, common);
+    expect(shipped.trades.length).toBe(off.trades.length);
+    expect(shipped.totalReturn).toBeCloseTo(off.totalReturn, 10);
   });
 });
