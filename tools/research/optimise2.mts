@@ -248,6 +248,12 @@ function sample(seed?: StrategyParams): StrategyParams {
 }
 
 // ---- stage 1: cheap search on the training window ------------------------
+/**
+ * `RESUME=1` picks up from the checkpoint instead of searching again, so a
+ * stage 2 that was cut short costs minutes to redo rather than hours.
+ */
+const RESUME = process.env.RESUME === "1" && fs.existsSync(`${OUT}/finalists.json`);
+
 console.log(
   `\n=== STAGE 1: ${TRIALS} trials on TRAIN ` +
     `(${subset.length} symbols, top ${subsetUniverse} tradable) ===`,
@@ -256,7 +262,7 @@ const stage1Started = Date.now();
 const stage1: { p: StrategyParams; fit: number; ret: number; trades: number }[] = [];
 let best: StrategyParams | undefined;
 
-for (let i = 0; i < TRIALS; i++) {
+for (let i = 0; RESUME ? false : i < TRIALS; i++) {
   /**
    * Progress first, before anything that can skip the rest of the loop.
    *
@@ -286,8 +292,35 @@ for (let i = 0; i < TRIALS; i++) {
   best = stage1[0]!.p;
 }
 
+if (RESUME) {
+  const saved = JSON.parse(fs.readFileSync(`${OUT}/finalists.json`, "utf8")) as {
+    at: number;
+    finalists: typeof stage1;
+  };
+  stage1.push(...saved.finalists);
+  console.log(
+    `resumed ${saved.finalists.length} finalists checkpointed ` +
+      `${((Date.now() - saved.at) / 60_000).toFixed(0)}m ago`,
+  );
+}
+
 console.log(`stage 1 survivors: ${stage1.length}, taking top ${KEEP}`);
 const finalists = stage1.slice(0, KEEP);
+
+/**
+ * Checkpoint before stage 2.
+ *
+ * Stage 1 is the expensive half — an hour and a half of search — and it
+ * lived only in memory. A run killed at a time limit during stage 2
+ * therefore threw all of it away and left nothing to resume from, which is
+ * exactly what happened. Writing the finalists costs a few hundred
+ * kilobytes and makes the second half restartable with RESUME=1.
+ */
+fs.writeFileSync(
+  `${OUT}/finalists.json`,
+  JSON.stringify({ at: Date.now(), trials: TRIALS, finalists }),
+);
+console.log(`checkpointed ${finalists.length} finalists to ${OUT}/finalists.json`);
 
 // ---- stage 2: validate across four disjoint windows ----------------------
 console.log(
