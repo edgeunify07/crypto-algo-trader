@@ -191,5 +191,7 @@ export const KEYS = {
   tickLog: "algo:ticks",
   tickLock: "algo:lock:tick",
   improveLock: "algo:lock:improve",
+  /** Fixed-window allowance for unauthenticated ticks; see `guard.ts`. */
+  publicTick: "algo:lock:public-tick",
   candles: (symbol: string, timeframe: string) => `algo:candles:${symbol}:${timeframe}`,
 } as const;

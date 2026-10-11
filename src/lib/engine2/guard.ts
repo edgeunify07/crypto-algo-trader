@@ -63,6 +63,44 @@ export function isAuthorised(request: Request, options: AuthOptions = {}): boole
   return options.allowSameOrigin === true && isSameOriginBrowserRequest(request);
 }
 
+/**
+ * How often an unauthenticated caller may advance the loop.
+ *
+ * The window is a fixed one, not a sliding one: the first caller in each
+ * window takes the allowance and everyone else is turned away cheaply until
+ * it expires.
+ */
+const PUBLIC_TICK_WINDOW_SECONDS = Number(process.env.PUBLIC_TICK_WINDOW_SECONDS ?? "60");
+
+/**
+ * May a caller with no credential advance the loop right now?
+ *
+ * Requiring a shared secret here protects less than it appears to. The
+ * dashboard is public, so anyone who finds the URL can already drive ticks
+ * simply by opening it; the secret stops a direct `curl` and nothing more.
+ * What it does do is make the scheduler impossible to set up without writing
+ * a secret into the repository — and a scheduler that is never set up is the
+ * difference between an engine that trades and one that sits idle.
+ *
+ * So an anonymous caller is let through at most once per window. That is a
+ * stronger guarantee than the secret gave, because it also caps the browser
+ * path the secret never touched: no caller, credentialled or not, can turn
+ * this endpoint into a way to spend someone else's serverless budget. A
+ * refused request costs one small KV write and returns.
+ *
+ * The allowance is taken by acquiring a lock that is never released, so it
+ * expires on its own. Nothing has to clean it up, and two instances racing
+ * cannot both take it.
+ */
+export async function claimPublicTick(
+  ttlSeconds = PUBLIC_TICK_WINDOW_SECONDS,
+): Promise<boolean> {
+  if (!(ttlSeconds > 0)) return true;
+  return kv().acquireLock(KEYS.publicTick, ttlSeconds);
+}
+
+export { PUBLIC_TICK_WINDOW_SECONDS };
+
 export async function withTickLock<T>(
   ttlSeconds: number,
   run: () => Promise<T>,

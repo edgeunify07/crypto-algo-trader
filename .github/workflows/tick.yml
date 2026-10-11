@@ -6,11 +6,17 @@
 # step: refresh candles, settle funding, manage stops and targets, and open
 # new positions when a setup qualifies.
 #
-# Setup (once):
-#   1. Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
-#        APP_URL       = https://your-app.vercel.app     (no trailing slash)
-#        CRON_SECRET   = the same value set in Vercel
-#   2. Repo -> Actions tab -> enable workflows if prompted.
+# Setup: none, if DEFAULT_APP_URL below points at your deployment. Both
+# repository secrets are optional overrides:
+#
+#   APP_URL      a different deployment to drive. Point it at the PRODUCTION
+#                URL: preview deployments sit behind Vercel Authentication and
+#                answer an unauthenticated request with a 302 to a login page,
+#                so every tick would be swallowed by a redirect.
+#   CRON_SECRET  the value set in Vercel. Without it the tick endpoint still
+#                accepts this workflow, but as an anonymous caller subject to
+#                its rate limit — fine at five-minute intervals. With it, the
+#                limit does not apply.
 #
 # Notes:
 #   - GitHub runs scheduled workflows on a best-effort basis; under load a run
@@ -26,6 +32,11 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+env:
+  # The deployment this repository drives. A public URL, so it belongs in the
+  # file rather than in a secret nobody can be sure got set.
+  DEFAULT_APP_URL: https://crypto-algo-trader.vercel.app
+
 # A slow tick must never have a second run pile up behind it.
 concurrency:
   group: trading-tick
@@ -38,21 +49,36 @@ jobs:
     steps:
       - name: Advance the trading loop
         env:
-          APP_URL: ${{ secrets.APP_URL }}
+          APP_URL: ${{ secrets.APP_URL || env.DEFAULT_APP_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
         run: |
           set -euo pipefail
 
-          if [ -z "${APP_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
-            echo "::error::APP_URL and CRON_SECRET repository secrets must both be set."
+          if [ -z "${APP_URL:-}" ]; then
+            echo "::error::No APP_URL. Set DEFAULT_APP_URL in this workflow or an APP_URL secret."
             exit 1
+          fi
+
+          # A preview deployment redirects to a Vercel login page instead of
+          # answering, which would look like a tick that silently did nothing.
+          status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --max-time 30 "${APP_URL}/api/v2/health" || echo 000)
+          if [ "$status" = "302" ] || [ "$status" = "307" ]; then
+            echo "::error::${APP_URL} redirects (HTTP $status) — it is protected by Vercel Authentication. Use the production URL."
+            exit 1
+          fi
+
+          # The secret is optional: without it the endpoint accepts this as an
+          # anonymous caller, which its rate limit allows at this interval.
+          auth=()
+          if [ -n "${CRON_SECRET:-}" ]; then
+            auth=(-H "Authorization: Bearer ${CRON_SECRET}")
           fi
 
           # --fail-with-body so a non-2xx still prints why it failed.
           response=$(curl --silent --show-error --fail-with-body \
             --max-time 90 --retry 2 --retry-delay 5 \
-            -X POST "${APP_URL}/api/v2/tick" \
-            -H "Authorization: Bearer ${CRON_SECRET}")
+            -X POST "${APP_URL}/api/v2/tick" "${auth[@]}")
 
           echo "$response"
 

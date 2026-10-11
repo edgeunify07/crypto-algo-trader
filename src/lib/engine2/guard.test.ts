@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { isAuthorised } from "./guard";
+import { claimPublicTick, isAuthorised } from "./guard";
+import { KEYS, kv } from "@/lib/store/kv";
 
 const SECRET = "test-secret-value";
 const URL_ = "https://app.example.com/api/v2/tick";
@@ -76,5 +77,30 @@ describe("isAuthorised", () => {
         expect(isAuthorised(request(), { allowSameOrigin: true })).toBe(false);
       });
     });
+  });
+});
+
+describe("claimPublicTick", () => {
+  afterEach(async () => {
+    await kv().releaseLock(KEYS.publicTick);
+  });
+
+  it("lets the first caller in a window through and turns the rest away", async () => {
+    expect(await claimPublicTick(60)).toBe(true);
+    expect(await claimPublicTick(60)).toBe(false);
+    expect(await claimPublicTick(60)).toBe(false);
+  });
+
+  it("opens again once the window expires", async () => {
+    // A window this short is only meaningful in a test; the point is that the
+    // allowance expires on its own rather than needing to be released.
+    expect(await claimPublicTick(1)).toBe(true);
+    await new Promise((r) => setTimeout(r, 1100));
+    expect(await claimPublicTick(1)).toBe(true);
+  });
+
+  it("is a no-op when the window is disabled", async () => {
+    expect(await claimPublicTick(0)).toBe(true);
+    expect(await claimPublicTick(0)).toBe(true);
   });
 });

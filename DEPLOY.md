@@ -49,12 +49,14 @@ If Binance turns out to be unreachable from whatever region your deployment land
 4. **Keep it ticking.** The Hobby plan allows Vercel Cron **once per day**, which is the right cadence for strategy improvement but far too slow to trade on. Two things drive the loop instead:
 
    - **The app itself.** While the PWA is open it calls `/api/v2/tick` every 20 seconds, and again whenever it returns to the foreground.
-   - **`.github/workflows/tick.yml`**, already in this repo, which ticks every 5 minutes so the loop keeps running when nobody is looking. Add two repository secrets under **Settings → Secrets and variables → Actions**:
+   - **`.github/workflows/tick.yml`**, already in this repo, which ticks every 5 minutes so the loop keeps running when nobody is looking. **It needs no secrets.** Point `DEFAULT_APP_URL` at the top of that file at your deployment and it works; both secrets below are optional overrides, under **Settings → Secrets and variables → Actions**:
 
-     | Secret | Value |
+     | Secret | Why you might set it |
      | --- | --- |
-     | `APP_URL` | `https://your-app.vercel.app` (no trailing slash) |
-     | `CRON_SECRET` | the same value you set in Vercel |
+     | `APP_URL` | to drive a different deployment than `DEFAULT_APP_URL`. No trailing slash. |
+     | `CRON_SECRET` | the value you set in Vercel. Without it the workflow ticks as an anonymous caller, which the endpoint rate-limits to one tick per minute — ample at five-minute intervals. With it, the limit does not apply. |
+
+     A secret is not required because requiring one protects less than it looks like it does: the dashboard is public, so anyone who finds the URL can already drive ticks by opening it. What the endpoint enforces instead is a rate limit on anonymous callers, which also caps the browser path the secret never touched. Nobody, credentialled or not, can use it to spend your serverless budget — and a scheduler that cannot be set up without writing a secret into a repository is a scheduler that never gets set up.
 
      > **The workflow file has to be on the repository's default branch.** GitHub runs `schedule:` triggers from the default branch only — from any other branch it is never scheduled, never appears under **Actions**, and reports no error anywhere. A `tick.yml` sitting on a feature branch has simply never run, which on the dashboard looks like an engine that went idle for no reason. Merge the branch, or change the default under **Settings → General → Default branch**.
 
