@@ -270,10 +270,32 @@ export interface VersionedParams {
  * eight-hour blocks returned a median of -27.8%, and the real series beat all
  * twelve. The entries are reading market structure, not noise.
  *
- * What this is not: 16 candidates cleared the bar and this is the best of
- * them, chosen on the same windows it is reported against, so expect less
- * live than the table shows. Four months is one market regime. The
- * improvement loop exists to beat this, not to be trusted by it.
+ * Those figures came from a search where fills were free. Once the engine
+ * started charging the spread and pricing gapped stops honestly, the same
+ * parameters measure at +10.88% on one continuous account over the same 83
+ * days — median window 21.56%, still 4 of 4 profitable, worst drawdown
+ * 16.9%. That is the number to hold in mind; the rest of this comment is
+ * how it was arrived at.
+ *
+ * A second search was then run with those costs charged from the start, in
+ * case parameters chosen under free fills were tuned for the wrong
+ * objective. They were not. Charging execution dropped the share of random
+ * trials that survive training from 53% to 19%, and the best of the 30
+ * finalists lost to what is already here on every axis:
+ *
+ *                  median   windows   worst DD   trades    OOS1
+ *   these           21.56%      4/4      16.9%       87   +40.2%
+ *   re-tune         17.76%      3/4      33.2%      140   -29.2%
+ *
+ * It traded 60% more and bought one catastrophic window for it. Nothing was
+ * promoted. A search that cannot beat the incumbent under honest costs is
+ * the best evidence available that the incumbent is not simply an artefact
+ * of the old fill model.
+ *
+ * What this is still not: 16 candidates cleared the bar originally and this
+ * is the best of them, chosen on the same windows it is reported against, so
+ * expect less live than the table shows. Four months is one market regime.
+ * The improvement loop exists to beat this, not to be trusted by it.
  */
 /**
  * The last moment of market data that influenced `DEFAULT_PARAMS`.
