@@ -62,6 +62,10 @@ If Binance turns out to be unreachable from whatever region your deployment land
 
      To check: the **Actions** tab should list a `tick` workflow with recent runs. If the tab is empty, the file is not on the default branch. `/api/v2/health` says the same thing whenever the engine has not ticked for fifteen minutes.
 
+     > **Point `APP_URL` at the production deployment, not a preview.** Preview deployments sit behind Vercel Authentication, which answers an unauthenticated request with a `302` to a Vercel login page. The scheduler sends `Authorization: Bearer $CRON_SECRET` and nothing else, so against a preview URL every tick is redirected and none of them ever reach the app — a failure that looks, again, exactly like an engine that went idle. `curl -s -o /dev/null -w '%{http_code}' "$APP_URL/api/v2/health"` must return `200`; a `302` means the URL is protected.
+     >
+     > Vercel only rebuilds production from its **production branch** (`master` unless you changed it). Pushing to a feature branch creates a preview and leaves production exactly where it was, so a production URL can keep serving a months-old build while every push reports success. Merge to the production branch to actually ship.
+
    On Vercel Pro you can skip the Action: change the `vercel.json` cron to `* * * * *`.
 
 ## If something looks wrong, check `/api/v2/health` first
