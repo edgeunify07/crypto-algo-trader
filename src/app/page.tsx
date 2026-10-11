@@ -8,6 +8,7 @@ import {
   MarketList,
   OrderBook,
   StrategyPanel,
+  TickPrice,
   TickerBar,
   TradeTape,
   useBook,
@@ -441,22 +442,37 @@ export default function Home() {
 
             <div className="min-w-0 space-y-2">
               <TickerBar symbol={symbol} book={book} />
-              {/* Horizontal symbol rail replaces the sidebar on a phone. */}
+              {/*
+                Horizontal symbol rail, replacing the sidebar on a phone.
+
+                Each chip leads with the live price rather than the strategy
+                score. The score only changes when the engine ticks, so a rail
+                of scores sits perfectly still between ticks and reads as a
+                page that has stopped working — on the one row whose purpose
+                is to show ten markets moving at once. The score keeps its
+                place underneath, where standing still is what it should do.
+              */}
               <div className="flex gap-1 overflow-x-auto no-bar lg:hidden">
                 {marketRows.map((r) => (
                   <button
                     key={r.symbol}
                     onClick={() => selectSymbol(r.symbol)}
-                    className={`shrink-0 rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
+                    className={`shrink-0 rounded-lg px-2.5 py-1 text-left text-[11px] font-medium ${
                       symbol === r.symbol
                         ? "bg-[var(--surface-2)] text-[var(--text)]"
                         : "bg-[var(--surface)] text-[var(--muted)]"
                     }`}
                   >
-                    {r.symbol.replace("USDT", "")}
-                    <span className={`ml-1 tnum ${tone(r.score)}`}>
-                      {r.score >= 0 ? "+" : ""}{r.score.toFixed(2)}
-                    </span>
+                    <div className="flex items-baseline gap-1.5">
+                      <span>{r.symbol.replace("USDT", "")}</span>
+                      <TickPrice price={r.markPrice} />
+                    </div>
+                    <div className="text-[9px] leading-tight text-[var(--muted)]">
+                      score{" "}
+                      <span className={tone(r.score)}>
+                        {r.score >= 0 ? "+" : ""}{r.score.toFixed(2)}
+                      </span>
+                    </div>
                   </button>
                 ))}
               </div>

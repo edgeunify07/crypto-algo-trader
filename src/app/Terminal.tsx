@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /**
  * Terminal panels: market list, order book, trade tape and strategy readout.
@@ -30,6 +30,58 @@ const fmtPrice = (n: number) => {
 const pct = (n: number, d = 2) => `${n >= 0 ? "+" : ""}${(n * 100).toFixed(d)}%`;
 const tone = (n: number) =>
   n > 0 ? "text-[var(--up)]" : n < 0 ? "text-[var(--down)]" : "text-[var(--muted)]";
+
+/**
+ * Colour the last price by its own last move, up or down.
+ *
+ * A number that changes without flashing does not read as live — people
+ * watch for the tick, not for the digits. Colouring by the 24h change
+ * instead, as this did, leaves the price a constant red all day while it
+ * moves every second: the one element whose whole job is to prove the feed
+ * is alive was the one element that never changed.
+ */
+function useTickDirection(price: number | undefined): "up" | "down" | null {
+  const previous = useRef<number | undefined>(undefined);
+  const [direction, setDirection] = useState<"up" | "down" | null>(null);
+
+  useEffect(() => {
+    if (price === undefined || !(price > 0)) return;
+    const before = previous.current;
+    previous.current = price;
+    if (before === undefined || before === price) return;
+    setDirection(price > before ? "up" : "down");
+    // Long enough to see, short enough that the next tick is its own flash.
+    const fade = setTimeout(() => setDirection(null), 400);
+    return () => clearTimeout(fade);
+  }, [price]);
+
+  return direction;
+}
+
+/**
+ * A price that flashes its direction as it changes.
+ *
+ * Shared by the ticker strip and the phone rail so every live number on the
+ * page moves the same way.
+ */
+export function TickPrice({ price }: { price: number }) {
+  const direction = useTickDirection(price);
+  return (
+    <span
+      className="tnum transition-colors duration-150"
+      style={{
+        color:
+          direction === "up"
+            ? "var(--up)"
+            : direction === "down"
+              ? "var(--down)"
+              : "var(--text)",
+      }}
+    >
+      {fmtPrice(price)}
+    </span>
+  );
+}
 
 /** Left rail: every symbol the engine is watching today. */
 export function MarketList({
@@ -84,7 +136,9 @@ export function MarketList({
                   <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)]" />
                 )}
               </span>
-              <span className="text-right text-[11px] tnum">{fmtPrice(r.markPrice)}</span>
+              <span className="text-right text-[11px]">
+                <TickPrice price={r.markPrice} />
+              </span>
               <span className={`w-12 text-right text-[11px] tnum ${tone(r.score)}`}>
                 {r.score >= 0 ? "+" : ""}
                 {r.score.toFixed(2)}
@@ -385,13 +439,24 @@ export function TickerBar({
   book: BookData | null;
 }) {
   const t = book?.ticker;
+  const direction = useTickDirection(t?.lastPrice);
   return (
     <div className="flex items-center gap-3 overflow-x-auto no-bar rounded-xl bg-[var(--surface)] px-3 py-2">
       <span className="shrink-0 text-[13px] font-semibold">
         {symbol.replace("USDT", "")}
         <span className="text-[var(--muted)]">/USDT</span>
       </span>
-      <span className={`shrink-0 text-[17px] font-semibold tnum ${tone(t?.changePct ?? 0)}`}>
+      <span
+        className="shrink-0 text-[17px] font-semibold tnum transition-colors duration-150"
+        style={{
+          color:
+            direction === "up"
+              ? "var(--up)"
+              : direction === "down"
+                ? "var(--down)"
+                : "var(--text)",
+        }}
+      >
         {fmtPrice(t?.lastPrice ?? 0)}
       </span>
       <Metric label="24h" value={t ? pct(t.changePct) : "—"} cls={tone(t?.changePct ?? 0)} />
