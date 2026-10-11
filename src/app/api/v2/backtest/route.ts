@@ -32,6 +32,37 @@ export const maxDuration = 60;
 const CACHE_TTL_SECONDS = 1800;
 
 /**
+ * A short, stable fingerprint of the parameters themselves.
+ *
+ * The cache was keyed on the version *label*, which for the shipped defaults
+ * is the fixed string "default-v1" — so retuning those defaults left the key
+ * unchanged and the dashboard went on serving the previous parameters'
+ * results. Measured on the deployment right after a promotion: the cache said
+ * -3.01% over 40 trades while the same request computed fresh said +3.25%
+ * over 28. It healed itself half an hour later, which is worse than failing,
+ * because by then nobody is looking.
+ *
+ * Keys are sorted before hashing so a record loaded from storage, whose
+ * property order is whatever the serialiser chose, fingerprints the same as
+ * the literal in source.
+ */
+export function fingerprint(params: unknown): string {
+  const canonical = JSON.stringify(params, (_, value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : 1)))
+      : value,
+  );
+  // FNV-1a: not a security hash, just a cheap stable one with few collisions
+  // across the handful of parameter sets this will ever see.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < canonical.length; i++) {
+    h ^= canonical.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36);
+}
+
+/**
  * How many symbols the replay ranks between.
  *
  * Wider than the live universe so the point-in-time ranking has losers to
@@ -97,7 +128,7 @@ export async function GET(request: Request) {
 
   const store = kv();
   const stored = await loadParams();
-  const key = `algo:backtest:${stored.version}:${days}`;
+  const key = `algo:backtest:${stored.version}:${fingerprint(stored.params)}:${days}`;
 
   if (!force) {
     const cached = await store.get<CachedBacktest>(key);
