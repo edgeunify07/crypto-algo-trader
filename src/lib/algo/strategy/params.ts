@@ -118,9 +118,9 @@ export const StrategyParamsSchema = z.object({
    * and never passed 0.86, so a threshold chosen by intuition from the word
    * "confidence" barely fires at all: 0.80 is roughly one trade a month.
    *
-   * Lowering it to where it fires often makes the account worse, which is
-   * not what the win rate suggests. Over 83 out-of-sample days on one
-   * account:
+   * Lowering it to where it fires often costs money, which is not what the
+   * win rate suggests. Closing the *whole* position at the target, over 83
+   * out-of-sample days on one account:
    *
    *     threshold   scalps   won    scalp P&L   account
    *     off              0     —            —   +22.04%
@@ -128,16 +128,26 @@ export const StrategyParamsSchema = z.object({
    *     >=0.70           9   9/9      +$23.90   +13.43%
    *     >=0.68          14  14/14     +$52.51    +9.74%
    *
-   * Every scalp won — 29 of 29 across the sweep — and each one left the
+   * Every scalp won — 29 of 29 across that sweep — and each one left the
    * account poorer. They are not losing trades; they are winning trades
    * taken instead of better ones. A scalp pre-empts the swing entry on the
    * same signal and closes at a fixed 5% a position the swing exits would
-   * have carried further, while paying a second taker fee to do it. The
-   * profit is real and the opportunity cost is larger.
+   * have carried further, paying a second taker fee to do it. The profit is
+   * real and the opportunity cost is larger.
    *
-   * So the threshold stays at 0.80, where the rule fires on genuine
-   * outliers and cannot quietly eat the swing book. Lower it only with that
-   * table in view.
+   * `closeFraction` is the lever against exactly that, and it is what makes
+   * the rule affordable at a threshold where it actually fires. At 0.75:
+   *
+   *     close    scalps   won   scalp P&L   account
+   *     100%          2   2/2      +$3.58   +17.50%
+   *      75%          4   4/4      +$3.51   +19.93%
+   *      50%          4   4/4      +$4.17   +20.59%
+   *      25%          4   4/4      +$5.58   +21.96%
+   *
+   * Taking half at the target and leaving half on the swing ladder keeps the
+   * fast exit while giving up almost none of the run — the defaults below.
+   * Below 0.70 no fraction rescues it: the rule fires too often and the
+   * account lands near 15% whatever it closes.
    */
   scalp: z
     .object({
@@ -154,13 +164,21 @@ export const StrategyParamsSchema = z.object({
        * sized down to nothing to keep the same risk.
        */
       atrStopMultiple: z.number().min(0.3).max(4),
+      /**
+       * How much of the position the target closes. Below 1 the remainder
+       * stays on the swing ladder, which is the lever against a scalp's one
+       * real cost: it takes 5% from a position the swing exits would have
+       * carried further.
+       */
+      closeFraction: z.number().min(0.1).max(1),
     })
     .default({
       enabled: true,
-      minConfidence: 0.8,
+      minConfidence: 0.75,
       targetPct: 0.05,
       maxHoldBars: 24,
       atrStopMultiple: 1.2,
+      closeFraction: 0.5,
     }),
 
   risk: z.object({
@@ -317,11 +335,12 @@ export const DEFAULT_PARAMS: StrategyParams = {
   },
   scalp: {
     enabled: true,
-    // Rare by design — see the measured table in the schema above.
-    minConfidence: 0.8,
+    minConfidence: 0.75,
     targetPct: 0.05,
     maxHoldBars: 24,
     atrStopMultiple: 1.2,
+    // Half at the target, half left on the swing ladder — see the table above.
+    closeFraction: 0.5,
   },
 };
 

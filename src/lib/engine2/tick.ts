@@ -411,7 +411,16 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       },
     ];
 
-    if (params.entry.requireElliottAgreement && anchorForGates) {
+    /**
+     * The agreement gates only mean something once there is a direction to
+     * agree with. With a flat blend they rendered as "Gann agrees: short,
+     * needs flat" — a check that cannot pass, phrased as though the market
+     * owed it something, next to a direction gate already saying the real
+     * reason. Nothing is waiting on Gann here.
+     */
+    const directional = blended.direction !== "flat";
+
+    if (params.entry.requireElliottAgreement && anchorForGates && directional) {
       gates.push({
         name: "Elliott agrees",
         required: blended.direction,
@@ -421,7 +430,7 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
           anchorForGates.elliott.bias === blended.direction,
       });
     }
-    if (params.entry.requireGannAgreement && anchorForGates) {
+    if (params.entry.requireGannAgreement && anchorForGates && directional) {
       gates.push({
         name: "Gann agrees",
         required: blended.direction,
@@ -429,7 +438,7 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         passed: anchorForGates.gann.bias === blended.direction,
       });
     }
-    if (params.entry.avoidGannTimeCycle && anchorForGates) {
+    if (params.entry.avoidGannTimeCycle && anchorForGates && directional) {
       const { nearestCycle, distance, barsSinceAnchor } = anchorForGates.gann.timeCycle;
       const window = Math.max(1, Math.round(nearestCycle * 0.05));
       const inWindow = nearestCycle > 0 && barsSinceAnchor > 0 && distance <= window;
@@ -514,7 +523,7 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         closePosition(
           position,
           tp.price,
-          position.scalp ? "scalp_target" : "take_profit",
+          tp.scalp ? "scalp_target" : "take_profit",
           tp.fraction,
         );
       }
@@ -763,9 +772,19 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
                 side === "long"
                   ? mark * (1 + params.scalp.targetPct)
                   : mark * (1 - params.scalp.targetPct),
-              fraction: 1,
+              fraction: params.scalp.closeFraction,
               hit: false,
+              scalp: true,
             },
+            // Whatever the scalp leaves behind rides the swing ladder.
+            ...(params.scalp.closeFraction < 1
+              ? params.exit.takeProfitRMultiples.map((r, i) => ({
+                  price: side === "long" ? mark + stopDistance * r : mark - stopDistance * r,
+                  fraction:
+                    (params.exit.takeProfitFractions[i] ?? 0) * (1 - params.scalp.closeFraction),
+                  hit: false,
+                })).filter((tp) => tp.fraction > 0)
+              : []),
           ]
         : params.exit.takeProfitRMultiples
             .map((r, i) => ({
