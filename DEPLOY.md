@@ -64,6 +64,16 @@ If Binance turns out to be unreachable from whatever region your deployment land
 
      To check: the **Actions** tab should list a `tick` workflow with recent runs. If the tab is empty, the file is not on the default branch. `/api/v2/health` says the same thing whenever the engine has not ticked for fifteen minutes.
 
+     > **Do not rely on the GitHub schedule alone.** "Best effort" is weaker than it sounds: measured on this repository, a `*/5` schedule fired **once in nine hours** instead of about a hundred times. Runs are dropped under load rather than queued, and nothing reports it. Each run now ticks four times across its budget, which makes a surviving run worth more but does not close hour-long gaps.
+     >
+     > This matters beyond missed entries. The engine only checks stops when it ticks, so a long gap means a stop can be overshot well past its price before anything notices — the live account can lose more than the backtest modelled. For anything you care about, point a second scheduler at the tick endpoint. It needs no credentials, so any free pinger works:
+     >
+     > ```
+     > POST https://your-app.vercel.app/api/v2/tick    every 1–5 minutes
+     > ```
+     >
+     > [cron-job.org](https://cron-job.org) and [UptimeRobot](https://uptimerobot.com) both do this on a free tier. The endpoint rate-limits anonymous callers to one tick a minute, so over-scheduling is harmless.
+
      > **Point `APP_URL` at the production deployment, not a preview.** Preview deployments sit behind Vercel Authentication, which answers an unauthenticated request with a `302` to a Vercel login page. The scheduler sends `Authorization: Bearer $CRON_SECRET` and nothing else, so against a preview URL every tick is redirected and none of them ever reach the app — a failure that looks, again, exactly like an engine that went idle. `curl -s -o /dev/null -w '%{http_code}' "$APP_URL/api/v2/health"` must return `200`; a `302` means the URL is protected.
      >
      > Vercel only rebuilds production from its **production branch** (`master` unless you changed it). Pushing to a feature branch creates a preview and leaves production exactly where it was, so a production URL can keep serving a months-old build while every push reports success. Merge to the production branch to actually ship.
