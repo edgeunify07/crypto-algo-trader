@@ -1,0 +1,73 @@
+# Drives the trading loop when nobody has the app open.
+#
+# Vercel Cron on the Hobby plan fires once per day, which is fine for the
+# daily strategy-improvement round but far too slow to trade on. This runs
+# every 5 minutes and calls the tick endpoint, which advances the loop by one
+# step: refresh candles, settle funding, manage stops and targets, and open
+# new positions when a setup qualifies.
+#
+# Setup (once):
+#   1. Repo -> Settings -> Secrets and variables -> Actions -> New repository secret
+#        APP_URL       = https://your-app.vercel.app     (no trailing slash)
+#        CRON_SECRET   = the same value set in Vercel
+#   2. Repo -> Actions tab -> enable workflows if prompted.
+#
+# Notes:
+#   - GitHub runs scheduled workflows on a best-effort basis; under load a run
+#     can be delayed by several minutes. The tick is idempotent and holds a
+#     lock, so a late or doubled run is harmless.
+#   - GitHub disables schedules after 60 days with no repository activity.
+#     Push a commit, or press "Run workflow", to re-arm it.
+
+name: tick
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+# A slow tick must never have a second run pile up behind it.
+concurrency:
+  group: trading-tick
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Advance the trading loop
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APP_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::APP_URL and CRON_SECRET repository secrets must both be set."
+            exit 1
+          fi
+
+          # --fail-with-body so a non-2xx still prints why it failed.
+          response=$(curl --silent --show-error --fail-with-body \
+            --max-time 90 --retry 2 --retry-delay 5 \
+            -X POST "${APP_URL}/api/v2/tick" \
+            -H "Authorization: Bearer ${CRON_SECRET}")
+
+          echo "$response"
+
+          # Surface the outcome in the run summary. jq is preinstalled on
+          # ubuntu-latest; the // fallbacks keep this working if a field is absent.
+          {
+            if [ "$(jq -r '.skipped // false' <<< "$response")" = "true" ]; then
+              echo "Skipped: $(jq -r '.reason // "unknown"' <<< "$response")"
+            else
+              echo "- equity: \$$(jq -r '.equity // 0 | . * 10000 | round / 10000' <<< "$response")"
+              echo "- positions: $(jq -r '.positions // 0' <<< "$response")"
+              echo "- opened: $(jq -r '.opened | length' <<< "$response"), closed: $(jq -r '.closed | length' <<< "$response")"
+              echo "- duration: $(jq -r '.durationMs // 0' <<< "$response")ms"
+              if [ "$(jq -r '.durable // false' <<< "$response")" != "true" ]; then
+                echo "> **Warning:** storage is not durable — set the Upstash env vars in Vercel."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

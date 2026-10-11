@@ -45,3 +45,4 @@ next-env.d.ts
 
 # throwaway analysis scripts
 scripts/scratch/
+scratch/

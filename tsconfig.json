@@ -30,5 +30,15 @@
     ".next/dev/types/**/*.ts",
     "**/*.mts"
   ],
-  "exclude": ["node_modules", "scripts/scratch"]
+  "exclude": [
+    "node_modules",
+    "scratch",
+    "tools",
+    // `algo-screener` is a separate standalone project with its own
+    // tsconfig and its own dependencies (ws, @anthropic-ai/sdk). Vercel runs
+    // `npm i` only at the repo root, so those are absent there and the Next
+    // build's type-check step fails on files it should never have compiled.
+    // It builds and tests itself via algo-screener/tsconfig.json.
+    "algo-screener"
+  ]
 }
