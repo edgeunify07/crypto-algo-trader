@@ -45,6 +45,11 @@ async function handle(request: Request) {
         equity: r.equity,
         positions: r.positions.length,
         notes: r.notes,
+        // Returned inline so the dashboard can populate even when storage is
+        // not configured — otherwise a missing Upstash binding shows up as an
+        // empty market list, which looks like the engine failing rather than
+        // the deployment missing a variable.
+        screener: r.screener,
       },
       { headers: { "cache-control": "no-store" } },
     );

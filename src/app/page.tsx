@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chart from "./Chart";
 import BacktestPanel from "./BacktestPanel";
+import { useBinanceStream } from "./useBinanceStream";
 import {
   MarketList,
   OrderBook,
@@ -207,6 +208,11 @@ export default function Home() {
       if (body?.error) setError(body.error);
       else if (body?.ok || body?.skipped) {
         setLastTick(Date.now());
+        // The tick carries the fresh screener, so the view fills in even when
+        // storage is unavailable and the cached copy would be empty.
+        if (Array.isArray(body.screener) && body.screener.length > 0) {
+          setRows(body.screener);
+        }
         setError(null);
       }
       await refresh();
@@ -254,12 +260,42 @@ export default function Home() {
    */
   const [picked, setPicked] = useState<string | null>(null);
   const symbol = picked ?? rows[0]?.symbol ?? "BTCUSDT";
-  const book = useBook(symbol);
+  const [chartTf, setChartTf] = useState("1h");
   const selectSymbol = useCallback((s: string) => setPicked(s), []);
+
+  // Live market data straight from the exchange. The polled book stays as a
+  // fallback for anywhere the socket cannot reach.
+  const watchlist = rows.length > 0 ? rows.map((r) => r.symbol) : [symbol];
+  const stream = useBinanceStream(symbol, chartTf, watchlist);
+  const polled = useBook(symbol);
+
+  /**
+   * Merged per field rather than per source.
+   *
+   * A socket can connect and still deliver only some of its streams — in a
+   * restricted region the timer-driven depth feed arrives while the
+   * event-driven trade and ticker feeds never do. Choosing the whole object
+   * from one source would then blank the panels that happen to be missing, so
+   * each field independently prefers the socket and falls back to the poll.
+   */
+  const book = {
+    bids: stream.depth?.bids ?? polled?.bids ?? [],
+    asks: stream.depth?.asks ?? polled?.asks ?? [],
+    maxTotal: stream.depth?.maxTotal ?? polled?.maxTotal ?? 0,
+    spread: stream.depth?.spread ?? polled?.spread ?? 0,
+    spreadPct: stream.depth?.spreadPct ?? polled?.spreadPct ?? 0,
+    trades: stream.trades.length > 0 ? stream.trades : (polled?.trades ?? []),
+    ticker: stream.ticker ?? polled?.ticker ?? null,
+    updatedAt: lastTick,
+  };
+
+  // "Live" only when the socket is actually delivering price, not merely open.
+  const streaming = stream.connected && (stream.kline !== null || stream.ticker !== null);
 
   const marketRows = rows.map((r) => ({
     symbol: r.symbol,
-    markPrice: r.markPrice,
+    markPrice: stream.prices[r.symbol]?.price ?? r.markPrice,
+    changePct: stream.prices[r.symbol]?.changePct,
     score: r.score,
     direction: r.direction,
     alignment: r.alignment,
@@ -351,6 +387,7 @@ export default function Home() {
         </div>
 
         {state && !state.durable && <StorageWarning health={health} />}
+
         {acct?.haltedReason && (
           <Banner tone="down">Entries halted: {acct.haltedReason}</Banner>
         )}
@@ -412,7 +449,12 @@ export default function Home() {
                 ))}
               </div>
               {selectedRow && <SignalHeadline row={selectedRow} />}
-              <Chart symbol={symbol} />
+              <Chart
+                symbol={symbol}
+                liveKline={stream.kline}
+                onTimeframe={setChartTf}
+                streaming={streaming}
+              />
               <BacktestPanel days={30} />
               <LiveTab positions={state?.positions ?? []} />
             </div>
@@ -455,7 +497,12 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <Chart symbol={symbol} />
+            <Chart
+              symbol={symbol}
+              liveKline={stream.kline}
+              onTimeframe={setChartTf}
+              streaming={streaming}
+            />
             <div className="grid gap-2 sm:grid-cols-2 lg:hidden">
               <OrderBook book={book} symbol={symbol} />
               <TradeTape book={book} />
@@ -570,15 +617,13 @@ function StorageWarning({
     <Banner tone="warn">
       {missing.length > 0 ? (
         <>
-          Not visible to this deployment: {missing.join(", ")}.{" "}
-          <strong>Vercel only applies new variables on a fresh deployment</strong> —
-          add them, then redeploy.
+          Storage off — P&amp;L resets each request. {missing.length} var(s)
+          missing on this deployment. In Vercel, variables are scoped per
+          environment: tick <strong>Preview</strong> as well as Production, then
+          redeploy.
         </>
       ) : (
         <>Storage is not configured — state resets on every request.</>
-      )}
-      {health?.region && (
-        <span className="opacity-70"> (region {health.region})</span>
       )}
     </Banner>
   );

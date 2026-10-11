@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import type { LiveKline } from "./useBinanceStream";
 
 /**
  * Candlestick chart with indicator overlays, drawn as inline SVG.
@@ -93,13 +94,10 @@ export interface ChartData {
 const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
 
 /**
- * Every timeframe polls fast, because on all of them the bar currently forming
- * moves with price — a 1d chart's last candle changes just as continuously as
- * a 1m one, it simply takes longer to close. The cost is bounded: the closed
- * bars are served from cache keyed to the timeframe, so a poll only fetches
- * the one forming bar and recomputes the indicator series over it.
+ * The server poll now only refreshes closed history and the analysis — the
+ * websocket carries the live bar — so it can be slow and cheap.
  */
-const REFRESH_MS = 3500;
+const REFRESH_MS = 15_000;
 
 const UP = "#22c98b";
 const DOWN = "#ff5570";
@@ -112,7 +110,18 @@ function fmt(n: number): string {
   return n.toFixed(6);
 }
 
-export default function Chart({ symbol }: { symbol: string }) {
+export default function Chart({
+  symbol,
+  liveKline,
+  onTimeframe,
+  streaming,
+}: {
+  symbol: string;
+  /** Latest bar from the websocket; redraws between server refreshes. */
+  liveKline?: LiveKline | null;
+  onTimeframe?: (tf: string) => void;
+  streaming?: boolean;
+}) {
   const [timeframe, setTimeframe] = useState("1h");
   const [data, setData] = useState<ChartData | null>(null);
   const [loading, setLoading] = useState(true);
@@ -155,7 +164,33 @@ export default function Chart({ symbol }: { symbol: string }) {
     };
   }, [symbol, timeframe]);
 
+  /**
+   * Server candles with the websocket bar merged in.
+   *
+   * The server poll is the source of closed history; the socket supplies the
+   * bar currently forming. Merging here rather than in the fetch means the
+   * chart redraws on every tick from the exchange instead of waiting for the
+   * next poll, and the price scale is recomputed with it so a fast move does
+   * not run off the top of the view.
+   */
+  const merged = useMemo(() => {
+    if (!data) return null;
+    const candles = [...data.candles];
+    if (liveKline) {
+      const last = candles.at(-1);
+      const bar: Candle = {
+        t: liveKline.t, o: liveKline.o, h: liveKline.h,
+        l: liveKline.l, c: liveKline.c, v: liveKline.v,
+        live: !liveKline.closed,
+      };
+      if (last && last.t === bar.t) candles[candles.length - 1] = bar;
+      else if (!last || bar.t > last.t) candles.push(bar);
+    }
+    return { ...data, candles };
+  }, [data, liveKline]);
+
   const geom = useMemo(() => {
+    const data = merged;
     if (!data || data.candles.length === 0) return null;
 
     const W = 1000;
@@ -173,8 +208,8 @@ export default function Chart({ symbol }: { symbol: string }) {
       // Liquidation is often far away; include it only when it is close
       // enough to be worth seeing, so it cannot flatten the whole chart.
       const last = data.candles.at(-1)!.c;
-      if (Math.abs(data.position.liquidationPrice - last) / last < 0.25) {
-        extras.push(data.position.liquidationPrice);
+      if (Math.abs(merged.position!.liquidationPrice - last) / last < 0.25) {
+        extras.push(merged.position!.liquidationPrice);
       }
     }
 
@@ -204,7 +239,7 @@ export default function Chart({ symbol }: { symbol: string }) {
     };
 
     return { W, H, PAD_R, PAD_B, x, y, bw, path, hi, lo, n };
-  }, [data]);
+  }, [merged]);
 
   return (
     <div className="rounded-xl bg-[var(--surface)] overflow-hidden">
@@ -212,13 +247,16 @@ export default function Chart({ symbol }: { symbol: string }) {
       <div className="flex items-center gap-1 px-2 pt-2">
         <span
           key={tickAt}
-          className="live-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--up)]"
-          title="updating live"
+          className={`h-1.5 w-1.5 shrink-0 rounded-full ${streaming ? "live-dot bg-[var(--up)]" : "bg-[var(--muted)]"}`}
+          title={streaming ? "streaming from Binance" : "polling"}
         />
         {TIMEFRAMES.map((tf) => (
           <button
             key={tf}
-            onClick={() => setTimeframe(tf)}
+            onClick={() => {
+              setTimeframe(tf);
+              onTimeframe?.(tf);
+            }}
             className={`flex-1 rounded-md py-1.5 text-[11px] font-medium ${
               timeframe === tf
                 ? "bg-[var(--surface-2)] text-[var(--text)]"
@@ -239,7 +277,7 @@ export default function Chart({ symbol }: { symbol: string }) {
         </div>
       )}
 
-      {data && geom && (
+      {merged && geom && (
         <>
           <svg
             viewBox={`0 0 ${geom.W} ${geom.H}`}
@@ -248,11 +286,11 @@ export default function Chart({ symbol }: { symbol: string }) {
             preserveAspectRatio="none"
           >
             {/* Bollinger envelope */}
-            <path d={geom.path(data.indicators.bbUpper)} fill="none" stroke="#3a4a63" strokeWidth={1.2} />
-            <path d={geom.path(data.indicators.bbLower)} fill="none" stroke="#3a4a63" strokeWidth={1.2} />
+            <path d={geom.path(merged.indicators.bbUpper)} fill="none" stroke="#3a4a63" strokeWidth={1.2} />
+            <path d={geom.path(merged.indicators.bbLower)} fill="none" stroke="#3a4a63" strokeWidth={1.2} />
 
             {/* candles */}
-            {data.candles.map((c, i) => {
+            {merged.candles.map((c, i) => {
               const up = c.c >= c.o;
               const colour = up ? UP : DOWN;
               const yO = geom.y(c.o);
@@ -278,12 +316,12 @@ export default function Chart({ symbol }: { symbol: string }) {
             })}
 
             {/* EMA pair */}
-            <path d={geom.path(data.indicators.emaFast)} fill="none" stroke="#5aa9ff" strokeWidth={1.6} />
-            <path d={geom.path(data.indicators.emaSlow)} fill="none" stroke="#f5b942" strokeWidth={1.6} />
+            <path d={geom.path(merged.indicators.emaFast)} fill="none" stroke="#5aa9ff" strokeWidth={1.6} />
+            <path d={geom.path(merged.indicators.emaSlow)} fill="none" stroke="#f5b942" strokeWidth={1.6} />
 
             {/* swing pivots — what Elliott and Gann are built from */}
-            {data.pivots.map((p) => {
-              const i = data.candles.findIndex((c) => c.t >= p.t);
+            {merged.pivots.map((p) => {
+              const i = merged.candles.findIndex((c) => c.t >= p.t);
               if (i < 0) return null;
               return (
                 <circle
@@ -295,11 +333,11 @@ export default function Chart({ symbol }: { symbol: string }) {
             })}
 
             {/* open position levels */}
-            {data.position && (
+            {merged.position && (
               <>
-                <PriceLine geom={geom} price={data.position.entryPrice} colour="#5aa9ff" label="entry" />
-                <PriceLine geom={geom} price={data.position.stopLoss} colour={DOWN} label="stop" dashed />
-                {data.position.takeProfits
+                <PriceLine geom={geom} price={merged.position.entryPrice} colour="#5aa9ff" label="entry" />
+                <PriceLine geom={geom} price={merged.position.stopLoss} colour={DOWN} label="stop" dashed />
+                {merged.position.takeProfits
                   .filter((tp) => !tp.hit)
                   .map((tp, i) => (
                     <PriceLine key={i} geom={geom} price={tp.price} colour={UP} label={`tp${i + 1}`} dashed />
@@ -308,9 +346,9 @@ export default function Chart({ symbol }: { symbol: string }) {
             )}
 
             {/* executed fills */}
-            {data.fills.map((f, i) => {
-              const ei = data.candles.findIndex((c) => c.t >= f.openedAt);
-              const xi = data.candles.findIndex((c) => c.t >= f.closedAt);
+            {merged.fills.map((f, i) => {
+              const ei = merged.candles.findIndex((c) => c.t >= f.openedAt);
+              const xi = merged.candles.findIndex((c) => c.t >= f.closedAt);
               return (
                 <g key={i}>
                   {ei >= 0 && (
@@ -333,9 +371,9 @@ export default function Chart({ symbol }: { symbol: string }) {
             {/* last price tag */}
             <PriceLine
               geom={geom}
-              price={data.candles.at(-1)!.c}
+              price={merged.candles.at(-1)!.c}
               colour={MUTED}
-              label={fmt(data.candles.at(-1)!.c)}
+              label={fmt(merged.candles.at(-1)!.c)}
               solidTag
             />
           </svg>
@@ -343,24 +381,24 @@ export default function Chart({ symbol }: { symbol: string }) {
           {/* RSI / MACD strip */}
           <svg viewBox={`0 0 ${geom.W} 70`} className="w-full" style={{ height: 52 }} preserveAspectRatio="none">
             <SubPlot
-              series={data.indicators.rsi}
+              series={merged.indicators.rsi}
               width={geom.W - geom.PAD_R}
               min={0}
               max={100}
-              bands={[data.indicators.rsiOversold, data.indicators.rsiOverbought]}
+              bands={[merged.indicators.rsiOversold, merged.indicators.rsiOverbought]}
               colour="#a78bfa"
             />
           </svg>
 
           <div className="flex items-center gap-3 px-3 pb-1 text-[9px] text-[var(--muted)]">
-            <Legend colour="#5aa9ff" label={`EMA${data.indicators.emaFastPeriod}`} />
-            <Legend colour="#f5b942" label={`EMA${data.indicators.emaSlowPeriod}`} />
+            <Legend colour="#5aa9ff" label={`EMA${merged.indicators.emaFastPeriod}`} />
+            <Legend colour="#f5b942" label={`EMA${merged.indicators.emaSlowPeriod}`} />
             <Legend colour="#3a4a63" label="Bollinger" />
             <Legend colour="#a78bfa" label="RSI" />
             <span className="ml-auto">pivots ○ · fills ▲■ · hollow = forming</span>
           </div>
 
-          {data.analysis && <Readout data={data} />}
+          {merged.analysis && <Readout data={merged} />}
         </>
       )}
     </div>
