@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { runTick } from "@/lib/engine2/tick";
-import { isAuthorised, withTickLock } from "@/lib/engine2/guard";
+import {
+  PUBLIC_TICK_WINDOW_SECONDS,
+  claimPublicTick,
+  isAuthorised,
+  withTickLock,
+} from "@/lib/engine2/guard";
 
 /**
  * Advance the trading loop by one step.
@@ -10,6 +15,12 @@ import { isAuthorised, withTickLock } from "@/lib/engine2/guard";
  * inside one never fires again. Instead each call does exactly one complete
  * step and persists the result, and the schedule comes from outside — the open
  * PWA while someone is watching, and an external scheduler otherwise.
+ *
+ * Three kinds of caller reach this, in descending order of trust: a scheduler
+ * holding `CRON_SECRET`, the deployment's own page, and anyone else. The
+ * third is allowed through at a strict rate limit rather than refused,
+ * because a scheduler nobody can set up without writing a secret into a
+ * repository is a scheduler that never gets set up.
  */
 export const dynamic = "force-dynamic";
 export const maxDuration = 60;
@@ -18,7 +29,23 @@ async function handle(request: Request) {
   // The open dashboard is this loop's primary scheduler, so its own fetches
   // count as authorised even once a cron secret is configured.
   if (!isAuthorised(request, { allowSameOrigin: true })) {
-    return NextResponse.json({ error: "unauthorised" }, { status: 401 });
+    /**
+     * No credential. Rather than refuse outright, spend the window's public
+     * allowance — which is what lets a scheduler drive this with nothing
+     * configured but a URL. `claimPublicTick` explains why that is not the
+     * loosening it looks like.
+     */
+    if (!(await claimPublicTick())) {
+      return NextResponse.json(
+        {
+          skipped: true,
+          reason:
+            `unauthenticated ticks are limited to one per ${PUBLIC_TICK_WINDOW_SECONDS}s; ` +
+            "send CRON_SECRET as a bearer token to tick without the limit",
+        },
+        { status: 202, headers: { "cache-control": "no-store" } },
+      );
+    }
   }
 
   const url = new URL(request.url);
