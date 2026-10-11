@@ -14,6 +14,14 @@
  *
  * Ranking uses the median window return rather than the mean, so a single
  * outlier window cannot carry a candidate that is otherwise mediocre.
+ *
+ * Every backtest here re-ranks its symbols by trailing volume at each step and
+ * only trades the top `UNIVERSE`, exactly as the live engine does. Searching
+ * over a pool fixed at today's top ten instead — which is what the earlier
+ * runs did — hands the optimiser the coins that already had the biggest
+ * months, and it will happily tune into that: the same shipped parameters
+ * score +26% on the last 30 days that way and -2.4% once the ranking is
+ * honest. A search is only as truthful as the window it is scored on.
  */
 import { runFuturesBacktest, type BacktestInput, type BacktestResult } from "@/lib/improve2/backtest";
 import {
@@ -29,9 +37,28 @@ const OUT = process.env.OUT ?? "/tmp";
 const TRIALS = Number(process.env.TRIALS ?? "600");
 const KEEP = Number(process.env.KEEP ?? "40");
 const DAYS = Number(process.env.DAYS ?? "150");
+/** Symbols the ranking chooses between. Wider than the engine trades. */
+const POOL = Number(process.env.POOL ?? "24");
+/** Symbols tradable at once — the live `UNIVERSE_SIZE`. */
+const UNIVERSE = Number(process.env.UNIVERSE ?? "10");
+/** Stage 1 runs on a slice of the pool, at the same pool-to-tradable ratio. */
+const SUBSET = Number(process.env.SUBSET ?? "12");
 const TFS: Timeframe[] = ["15m", "1h", "4h"];
 const STEP: Timeframe = "1h";
 const HOST = "https://www.binance.com";
+
+const EXCLUDED = new Set(["USDCUSDT", "BUSDUSDT", "FDUSDUSDT", "TUSDUSDT"]);
+
+/** Today's highest-volume perpetuals, which is as far back as listings go. */
+async function poolSymbols(size: number): Promise<string[]> {
+  const res = await fetch(`${HOST}/fapi/v1/ticker/24hr`, { cache: "no-store" });
+  const tickers = (await res.json()) as { symbol: string; quoteVolume: string; lastPrice: string }[];
+  return tickers
+    .filter((t) => t.symbol.endsWith("USDT") && !EXCLUDED.has(t.symbol) && +t.quoteVolume > 0 && +t.lastPrice > 0)
+    .sort((a, b) => +b.quoteVolume - +a.quoteVolume)
+    .slice(0, size)
+    .map((t) => t.symbol);
+}
 
 type RawKline = [number, string, string, string, string, string, number, string, number, string, string, string];
 
@@ -58,15 +85,14 @@ async function fetchDeep(symbol: string, interval: Timeframe, bars: number): Pro
   return out.filter((c) => c.closeTime < Date.now());
 }
 
-const cache = `${OUT}/klines${DAYS}.json`;
+const cache = `${OUT}/klines${DAYS}x${POOL}.json`;
 let bySym: Record<string, Record<string, Candle[]>>;
 
 if (fs.existsSync(cache)) {
   bySym = JSON.parse(fs.readFileSync(cache, "utf8"));
   console.log(`loaded ${Object.keys(bySym).length} symbols from cache`);
 } else {
-  const seed = JSON.parse(fs.readFileSync(`${OUT}/klines.json`, "utf8")) as Record<string, unknown>;
-  const symbols = Object.keys(seed);
+  const symbols = await poolSymbols(POOL);
   console.log(`fetching ${DAYS} days for ${symbols.length} symbols (paged)...`);
   const NEED: Record<string, number> = {
     "15m": DAYS * 96 + 400,
@@ -92,8 +118,11 @@ if (fs.existsSync(cache)) {
 const all: BacktestInput[] = Object.entries(bySym).map(([symbol, m]) => ({
   symbol, byTimeframe: new Map(Object.entries(m) as [Timeframe, Candle[]][]),
 }));
-// A cheaper subset for stage 1; stage 2 uses everything.
-const subset = all.slice(0, 5);
+// A cheaper subset for stage 1; stage 2 uses everything. The subset keeps the
+// pool's ratio of candidates to tradable slots, so a candidate that only wins
+// by being unselective does not sail through the cheap stage.
+const subset = all.slice(0, Math.min(SUBSET, all.length));
+const subsetUniverse = Math.max(1, Math.round((subset.length * UNIVERSE) / all.length));
 
 const stepAll = all.flatMap((d) => d.byTimeframe.get(STEP) ?? []);
 const latest = Math.max(...stepAll.map((c) => c.closeTime));
@@ -114,15 +143,31 @@ console.log(`\nhistory ${day(earliest)} -> ${day(latest)} (${totalDays.toFixed(0
 console.log(`TRAIN ${day(warm)} -> ${day(trainTo)}`);
 windows.forEach((w, i) => console.log(`  OOS${i + 1} ${day(w.from)} -> ${day(w.to)}`));
 
-const run = (data: BacktestInput[], p: StrategyParams, from: number, to: number) =>
-  runFuturesBacktest(data, p, { stepTimeframe: STEP, startingBalance: 100, from, to });
+/**
+ * One backtest. `universeSize` is the whole point of the pool: rank it at
+ * every step and trade only the top slice, which is the same partial
+ * information the live engine has.
+ */
+const run = (
+  data: BacktestInput[],
+  p: StrategyParams,
+  from: number,
+  to: number,
+  universeSize: number,
+) => runFuturesBacktest(data, p, { stepTimeframe: STEP, startingBalance: 100, from, to, universeSize });
+
+/** Stage 2 and the baseline: the full pool, the live number of slots. */
+const runFull = (p: StrategyParams, from: number, to: number) => run(all, p, from, to, UNIVERSE);
+/** Stage 1: the cheap slice, at the same ratio. */
+const runSubset = (p: StrategyParams, from: number, to: number) =>
+  run(subset, p, from, to, subsetUniverse);
 
 const line = (t: string, r: BacktestResult) =>
   `${t.padEnd(8)} ${String(r.trades.length).padStart(3)}t ${(r.totalReturn * 100).toFixed(2).padStart(8)}% ` +
   `DD${(r.maxDrawdown * 100).toFixed(1).padStart(5)}% PF${r.profitFactor.toFixed(2).padStart(5)} liq${r.liquidations}`;
 
 console.log("\n=== BASELINE (current shipped defaults) ===");
-const baseWindows = windows.map((w) => run(all, DEFAULT_PARAMS, w.from, w.to));
+const baseWindows = windows.map((w) => runFull(DEFAULT_PARAMS, w.from, w.to));
 baseWindows.forEach((r, i) => console.log(line(`OOS${i + 1}`, r)));
 const baseRets = baseWindows.map((r) => r.totalReturn).sort((a, b) => a - b);
 const baseMedian = (baseRets[1]! + baseRets[2]!) / 2;
@@ -203,27 +248,41 @@ function sample(seed?: StrategyParams): StrategyParams {
 }
 
 // ---- stage 1: cheap search on the training window ------------------------
-console.log(`\n=== STAGE 1: ${TRIALS} trials on TRAIN (${subset.length} symbols) ===`);
+console.log(
+  `\n=== STAGE 1: ${TRIALS} trials on TRAIN ` +
+    `(${subset.length} symbols, top ${subsetUniverse} tradable) ===`,
+);
+const stage1Started = Date.now();
 const stage1: { p: StrategyParams; fit: number; ret: number; trades: number }[] = [];
 let best: StrategyParams | undefined;
 
 for (let i = 0; i < TRIALS; i++) {
   const p = sample(best);
   if (!StrategyParamsSchema.safeParse(p).success) continue;
-  const r = run(subset, p, warm, trainTo);
+  const r = runSubset(p, warm, trainTo);
   if (r.trades.length < 10 || r.liquidations > 0 || r.totalReturn <= 0) continue;
   stage1.push({ p, fit: r.fitness, ret: r.totalReturn, trades: r.trades.length });
   // Seed refinement from the best point found so far.
   stage1.sort((a, b) => b.fit - a.fit);
   best = stage1[0]!.p;
-  if ((i + 1) % 100 === 0) console.log(`  ...${i + 1}/${TRIALS} survivors=${stage1.length}`);
+  if ((i + 1) % 25 === 0) {
+    const per = (Date.now() - stage1Started) / (i + 1);
+    const left = ((TRIALS - i - 1) * per) / 60_000;
+    console.log(
+      `  ...${i + 1}/${TRIALS} survivors=${stage1.length} ` +
+        `(${(per / 1000).toFixed(1)}s/trial, ~${left.toFixed(0)}m left)`,
+    );
+  }
 }
 
 console.log(`stage 1 survivors: ${stage1.length}, taking top ${KEEP}`);
 const finalists = stage1.slice(0, KEEP);
 
 // ---- stage 2: validate across four disjoint windows ----------------------
-console.log(`\n=== STAGE 2: ${finalists.length} finalists across 4 OOS windows (all symbols) ===`);
+console.log(
+  `\n=== STAGE 2: ${finalists.length} finalists across 4 OOS windows ` +
+    `(${all.length} symbols, top ${UNIVERSE} tradable) ===`,
+);
 interface Scored {
   p: StrategyParams;
   results: BacktestResult[];
@@ -236,7 +295,7 @@ interface Scored {
 const scored: Scored[] = [];
 
 for (const [i, f] of finalists.entries()) {
-  const results = windows.map((w) => run(all, f.p, w.from, w.to));
+  const results = windows.map((w) => runFull(f.p, w.from, w.to));
   const rets = results.map((r) => r.totalReturn).sort((a, b) => a - b);
   scored.push({
     p: f.p,

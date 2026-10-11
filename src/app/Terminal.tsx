@@ -201,10 +201,17 @@ function BookSide({
   );
 }
 
-/** Live trade tape. */
-export function TradeTape({ book }: { book: BookData | null }) {
+/**
+ * Trade tape.
+ *
+ * `live` says whether the prints are arriving on the socket or coming from
+ * the 3-second poll, because Binance withholds the trade stream in some
+ * regions and a tape that updates every three seconds otherwise reads as a
+ * broken one rather than a slower one.
+ */
+export function TradeTape({ book, live }: { book: BookData | null; live?: boolean }) {
   return (
-    <Panel title="Market trades">
+    <Panel title="Market trades" right={live ? undefined : "3s poll"}>
       <div className="grid grid-cols-3 px-2.5 pb-1 text-[9px] uppercase tracking-wide text-[var(--muted)]">
         <span>Price</span>
         <span className="text-right">Amount</span>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import type { LiveKline } from "./useBinanceStream";
+import type { LiveKline, LiveMark } from "./useBinanceStream";
 
 /**
  * Candlestick chart with indicator overlays, drawn as inline SVG.
@@ -113,12 +113,20 @@ function fmt(n: number): string {
 export default function Chart({
   symbol,
   liveKline,
+  mark,
   onTimeframe,
   streaming,
 }: {
   symbol: string;
   /** Latest bar from the websocket; redraws between server refreshes. */
   liveKline?: LiveKline | null;
+  /**
+   * Best bid/ask mid, used when the kline stream is withheld in this region.
+   * It moves the forming bar's close without inventing one: the open and the
+   * volume still come from the server poll, and only the extremes the browser
+   * has actually observed extend the high and low.
+   */
+  mark?: LiveMark | null;
   onTimeframe?: (tf: string) => void;
   streaming?: boolean;
 }) {
@@ -185,9 +193,24 @@ export default function Chart({
       };
       if (last && last.t === bar.t) candles[candles.length - 1] = bar;
       else if (!last || bar.t > last.t) candles.push(bar);
+    } else if (mark) {
+      // No kline stream here. The server poll still supplies the forming
+      // bar — open, volume, and the extremes up to the last poll — so the
+      // mid only has to carry the close and push the range out if the price
+      // has since gone beyond it.
+      const last = candles.at(-1);
+      if (last) {
+        candles[candles.length - 1] = {
+          ...last,
+          h: Math.max(last.h, mark.price),
+          l: Math.min(last.l, mark.price),
+          c: mark.price,
+          live: true,
+        };
+      }
     }
     return { ...data, candles };
-  }, [data, liveKline]);
+  }, [data, liveKline, mark]);
 
   const geom = useMemo(() => {
     const data = merged;

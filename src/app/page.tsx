@@ -278,19 +278,31 @@ export default function Home() {
    * from one source would then blank the panels that happen to be missing, so
    * each field independently prefers the socket and falls back to the poll.
    */
+  const base = stream.ticker ?? polled?.ticker ?? null;
   const book = {
     bids: stream.depth?.bids ?? polled?.bids ?? [],
     asks: stream.depth?.asks ?? polled?.asks ?? [],
     maxTotal: stream.depth?.maxTotal ?? polled?.maxTotal ?? 0,
-    spread: stream.depth?.spread ?? polled?.spread ?? 0,
-    spreadPct: stream.depth?.spreadPct ?? polled?.spreadPct ?? 0,
+    // Best quote beats both: it is the freshest number on the page.
+    spread: stream.mark?.spread ?? stream.depth?.spread ?? polled?.spread ?? 0,
+    spreadPct: stream.mark?.spreadPct ?? stream.depth?.spreadPct ?? polled?.spreadPct ?? 0,
     trades: stream.trades.length > 0 ? stream.trades : (polled?.trades ?? []),
-    ticker: stream.ticker ?? polled?.ticker ?? null,
-    updatedAt: lastTick,
+    /**
+     * Last price from the quote feed, the rest from whichever 24h source
+     * answered. Taking the whole ticker from one source would either freeze
+     * the price, where the 24h stream is withheld, or blank the day's range,
+     * where only the quote feed arrives.
+     */
+    ticker: base
+      ? { ...base, lastPrice: stream.mark?.price ?? base.lastPrice }
+      : stream.mark
+        ? { lastPrice: stream.mark.price, changePct: 0, high: 0, low: 0, quoteVolume: 0 }
+        : null,
+    updatedAt: stream.mark?.at ?? lastTick,
   };
 
   // "Live" only when the socket is actually delivering price, not merely open.
-  const streaming = stream.connected && (stream.kline !== null || stream.ticker !== null);
+  const streaming = stream.connected && (stream.feeds.book || stream.feeds.kline);
 
   const marketRows = rows.map((r) => ({
     symbol: r.symbol,
@@ -452,6 +464,7 @@ export default function Home() {
               <Chart
                 symbol={symbol}
                 liveKline={stream.kline}
+                mark={stream.mark}
                 onTimeframe={setChartTf}
                 streaming={streaming}
               />
@@ -461,7 +474,7 @@ export default function Home() {
 
             <div className="hidden lg:block space-y-2 lg:sticky lg:top-[150px] self-start">
               <OrderBook book={book} symbol={symbol} />
-              <TradeTape book={book} />
+              <TradeTape book={book} live={stream.feeds.trades} />
             </div>
 
             <div className="hidden xl:block space-y-2 xl:sticky xl:top-[150px] self-start">
@@ -500,12 +513,13 @@ export default function Home() {
             <Chart
               symbol={symbol}
               liveKline={stream.kline}
+              mark={stream.mark}
               onTimeframe={setChartTf}
               streaming={streaming}
             />
             <div className="grid gap-2 sm:grid-cols-2 lg:hidden">
               <OrderBook book={book} symbol={symbol} />
-              <TradeTape book={book} />
+              <TradeTape book={book} live={stream.feeds.trades} />
             </div>
             <div className="xl:hidden">
               <StrategyPanel info={strategy} gates={selectedRow?.gates ?? []} />
