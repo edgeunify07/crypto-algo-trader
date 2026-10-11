@@ -71,6 +71,44 @@ export interface BacktestResult {
 
 const ASSUMED_FUNDING_RATE = Number(process.env.BACKTEST_FUNDING_RATE ?? "0.0001");
 
+/**
+ * Move a fill price against the trader by `bps`.
+ *
+ * Buying fills a little higher than quoted, selling a little lower, which is
+ * the one direction slippage ever goes. `side` is the position's direction,
+ * and `entering` says which way the order runs: opening a long buys, closing
+ * one sells.
+ */
+export function slip(
+  price: number,
+  side: "long" | "short",
+  entering: boolean,
+  bps: number,
+): number {
+  if (!(bps > 0)) return price;
+  const buying = entering === (side === "long");
+  return price * (1 + (buying ? 1 : -1) * (bps / 10_000));
+}
+
+/**
+ * Where a stop or liquidation actually fills.
+ *
+ * A trigger the bar opened beyond was never available at its price. Filling
+ * there regardless credits the account with a trade that could not have
+ * happened — and it does so on precisely the bars that gap, which are the
+ * ones that do the damage. The fill is the worse of the trigger and the
+ * open, and then slipped for trading into the move that set it off.
+ */
+export function triggerFillPrice(
+  trigger: number,
+  barOpen: number,
+  side: "long" | "short",
+  bps: number,
+): number {
+  const gapped = side === "long" ? Math.min(trigger, barOpen) : Math.max(trigger, barOpen);
+  return slip(gapped, side, false, bps);
+}
+
 function lastClosedIndex(candles: Candle[], time: number, hint: number): number {
   let i = Math.max(0, hint);
   while (i < candles.length && (candles[i] as Candle).closeTime <= time) i++;
@@ -209,6 +247,8 @@ export function runFuturesBacktest(
     maxDrawdownHalt?: number;
     /** Notional ceiling as a multiple of equity, matching the risk manager. */
     maxPositionFraction?: number;
+    /** Override the fill-cost assumptions; defaults to the strategy's own. */
+    execution?: StrategyParams["execution"];
   } = {},
 ): BacktestResult {
   const {
@@ -218,6 +258,7 @@ export function runFuturesBacktest(
     riskPerTrade = 0.02,
     maxOpenPositions = Number(process.env.MAX_OPEN_POSITIONS ?? "3"),
     maxDrawdownHalt = Number(process.env.MAX_DRAWDOWN ?? "0.3"),
+    execution = params.execution,
     maxPositionFraction = Number(process.env.MAX_POSITION_FRACTION ?? "1.5"),
     windowBars = 260,
   } = options;
@@ -395,17 +436,20 @@ export function runFuturesBacktest(
             ? Math.max(open.extreme, nextBar.high)
             : Math.min(open.extreme, nextBar.low);
 
+        const triggerFill = (trigger: number, bps: number) =>
+          triggerFillPrice(trigger, nextBar.open, open.side, bps);
+
         // Liquidation first, then stop, then targets.
         const liqHit =
           open.side === "long" ? nextBar.low <= open.liq : nextBar.high >= open.liq;
         if (liqHit) {
-          close(d.symbol, st, open.liq, "liquidation", 1, nextBar.closeTime);
+          close(d.symbol, st, triggerFill(open.liq, execution.stopSlippageBps), "liquidation", 1, nextBar.closeTime);
           continue;
         }
         const stopHit =
           open.side === "long" ? nextBar.low <= open.stop : nextBar.high >= open.stop;
         if (stopHit) {
-          close(d.symbol, st, open.stop, "stop_loss", 1, nextBar.closeTime);
+          close(d.symbol, st, triggerFill(open.stop, execution.stopSlippageBps), "stop_loss", 1, nextBar.closeTime);
           continue;
         }
         for (const tp of open.targets) {
@@ -476,13 +520,20 @@ export function runFuturesBacktest(
         // Signal flip and time stop.
         const against = open.side === "long" ? -blended.score : blended.score;
         if (params.exit.exitOnScoreFlip > 0 && against >= params.exit.exitOnScoreFlip) {
-          close(d.symbol, st, nextBar.close, "signal_flip", 1, nextBar.closeTime);
+          close(d.symbol, st, slip(nextBar.close, open.side, false, execution.slippageBps), "signal_flip", 1, nextBar.closeTime);
           continue;
         }
         const barsHeld = Math.floor((now - open.openedAt) / TIMEFRAME_MS[open.timeframe]);
         const holdLimit = open.scalp ? params.scalp.maxHoldBars : params.exit.maxHoldBars;
         if (barsHeld >= holdLimit) {
-          close(d.symbol, st, nextBar.close, open.scalp ? "scalp_timeout" : "max_hold", 1, nextBar.closeTime);
+          close(
+            d.symbol,
+            st,
+            slip(nextBar.close, open.side, false, execution.slippageBps),
+            open.scalp ? "scalp_timeout" : "max_hold",
+            1,
+            nextBar.closeTime,
+          );
         }
         continue;
       }
@@ -507,7 +558,7 @@ export function runFuturesBacktest(
           (anchor.elliott.pattern === "none" || anchor.elliott.bias !== side)) continue;
       if (params.entry.requireGannAgreement && anchor.gann.bias !== side) continue;
 
-      const price = nextBar.open;
+      const quoted = nextBar.open;
       /**
        * A scalp when the blend is unusually sure. It takes a tighter stop as
        * well as a fixed target: keeping the swing stop would size the
@@ -516,6 +567,8 @@ export function runFuturesBacktest(
        */
       const isScalp =
         params.scalp.enabled && blended.confidence >= params.scalp.minConfidence;
+      // Crossing the spread to get in, before anything is sized off the price.
+      const price = slip(quoted, side, true, execution.slippageBps);
       const stopMultiple = isScalp
         ? params.scalp.atrStopMultiple
         : params.exit.atrStopMultiple;

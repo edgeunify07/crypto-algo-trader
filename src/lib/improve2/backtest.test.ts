@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { pointInTimeUniverse, runFuturesBacktest, type BacktestInput } from "./backtest";
+import {
+  pointInTimeUniverse,
+  runFuturesBacktest,
+  triggerFillPrice,
+  type BacktestInput,
+} from "./backtest";
 import { DEFAULT_PARAMS, type StrategyParams } from "@/lib/algo/strategy/params";
 import type { Candle, Timeframe } from "@/lib/algo/types";
 
@@ -271,5 +276,70 @@ describe("runFuturesBacktest scalp rule", () => {
     const off = runFuturesBacktest(data, TRADES_READILY, common);
     expect(shipped.trades.length).toBe(off.trades.length);
     expect(shipped.totalReturn).toBeCloseTo(off.totalReturn, 10);
+  });
+});
+
+describe("runFuturesBacktest execution costs", () => {
+  const trend = (bars: number, seed: number) =>
+    series(bars, () => 1_000, (i) => 100 * (1 + 0.004 * i + 0.02 * Math.sin((i + seed) / 7)));
+  const data = [input("A", trend(500, 0)), input("B", trend(500, 5))];
+  const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
+
+  /**
+   * The sign is the whole point. Slippage that helps is worse than no
+   * slippage at all: it would quietly inflate every result while looking
+   * like diligence.
+   */
+  it("always moves the fill against the position", () => {
+    const free = runFuturesBacktest(data, {
+      ...TRADES_READILY,
+      execution: { slippageBps: 0, stopSlippageBps: 0 },
+    }, common);
+    const costly = runFuturesBacktest(data, {
+      ...TRADES_READILY,
+      execution: { slippageBps: 50, stopSlippageBps: 50 },
+    }, common);
+
+    expect(free.trades.length).toBeGreaterThan(0);
+    expect(costly.totalReturn).toBeLessThan(free.totalReturn);
+  });
+
+  it("charges a long more to buy and gives it less to sell", () => {
+    const bps = 100; // 1%, large enough to read off the numbers directly.
+    const r = runFuturesBacktest(data, {
+      ...TRADES_READILY,
+      execution: { slippageBps: bps, stopSlippageBps: bps },
+    }, common);
+    const free = runFuturesBacktest(data, {
+      ...TRADES_READILY,
+      execution: { slippageBps: 0, stopSlippageBps: 0 },
+    }, common);
+
+    for (const [i, t] of r.trades.entries()) {
+      const base = free.trades[i];
+      if (!base || base.symbol !== t.symbol) continue;
+      if (t.side === "long") {
+        expect(t.entryPrice).toBeGreaterThan(base.entryPrice);
+      } else {
+        expect(t.entryPrice).toBeLessThan(base.entryPrice);
+      }
+    }
+  });
+
+  it("fills a stop that gapped at the open, not at the trigger", () => {
+    // A long stopped at 100 on a bar that opened at 80 never got 100.
+    expect(triggerFillPrice(100, 80, "long", 0)).toBe(80);
+    // No gap: the trigger stands.
+    expect(triggerFillPrice(100, 105, "long", 0)).toBe(100);
+    // A short's stop is above it, so the gap runs the other way.
+    expect(triggerFillPrice(100, 120, "short", 0)).toBe(120);
+    expect(triggerFillPrice(100, 95, "short", 0)).toBe(100);
+  });
+
+  it("slips the trigger fill against the position as well", () => {
+    // 100 bps on a long's stop: sells 1% below where it triggered.
+    expect(triggerFillPrice(100, 105, "long", 100)).toBeCloseTo(99, 10);
+    // A short buys back 1% above.
+    expect(triggerFillPrice(100, 95, "short", 100)).toBeCloseTo(101, 10);
   });
 });
