@@ -248,65 +248,81 @@ ${JSON.stringify(
 Propose exactly ${candidateCount} candidate patches testing distinct hypotheses. Return ONE JSON object.`;
 
   /**
-   * Each model is tried pinned, with its own timeout, rather than handing
-   * OpenRouter the whole list. OpenRouter's internal routing only fails over
-   * on an upstream error, so a primary that is merely *slow* holds the request
-   * until the function itself is killed — and a large reasoning model is
-   * routinely slower than a serverless budget allows. Pinning makes the
-   * failover deterministic: the primary gets a fixed slice, then the next
-   * model gets what remains.
+   * Models are hedged, not tried in turn.
+   *
+   * Each is pinned to its own request — handing OpenRouter the list instead
+   * fails over only on an upstream *error*, so a primary that is merely slow
+   * holds the request until the function is killed. But trying them in
+   * sequence is barely better: measured on the free tier, the 550B primary
+   * reliably overran a 20s slice while the 120B answered the same prompt in
+   * about 13s, so a sequential round spent its first 20 seconds learning
+   * nothing and then had too little left for the model that would have
+   * answered. Rounds returned no proposal at all.
+   *
+   * So the primary starts immediately and each failover starts a few seconds
+   * later, all against the same deadline, and the first valid proposal wins.
+   * The head start is what keeps the preference order meaningful: when the
+   * primary is healthy it is already most of the way through before the
+   * second request is even sent. Free models make the spare call free.
    */
-  const perModelMs = Number(process.env.LLM_PER_MODEL_MS ?? "20000");
-  const routes = MODELS.map((m) => [m]);
-  let lastError: unknown;
+  const perModelMs = Number(process.env.LLM_PER_MODEL_MS ?? String(budgetMs));
+  const hedgeDelayMs = Number(process.env.LLM_HEDGE_DELAY_MS ?? "7000");
 
-  for (const route of routes) {
+  const attempt = async (model: string, index: number) => {
+    if (index > 0) {
+      await new Promise((r) => setTimeout(r, Math.min(hedgeDelayMs * index, Math.max(0, deadline - Date.now()))));
+    }
     const remaining = deadline - Date.now();
-    // Leave no attempt less than 6s; a shorter one cannot finish anyway.
-    if (remaining < 6000) {
-      lastError = lastError ?? new Error("ran out of time budget before a model answered");
-      break;
-    }
-    try {
-      const { text, model } = await call(
-        route,
-        user,
-        maxTokens,
-        Math.min(remaining, perModelMs),
+    // An attempt shorter than this cannot finish, and failing fast gives the
+    // caller a clearer error than a truncated response.
+    if (remaining < 6000) throw new Error(`${model}: no time left in the budget`);
+
+    const { text, model: served } = await call(
+      [model],
+      user,
+      maxTokens,
+      Math.min(remaining, perModelMs),
+    );
+    const parsed = ProposalSchema.safeParse(extractJson(text));
+    if (!parsed.success) {
+      throw new Error(
+        `${model} schema: ${parsed.error.issues.slice(0, 4).map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`,
       );
-      const parsed = ProposalSchema.safeParse(extractJson(text));
-      if (!parsed.success) {
-        lastError = new Error(
-          `schema: ${parsed.error.issues.slice(0, 4).map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`,
-        );
-        continue;
-      }
-
-      const candidates: ProposedCandidate[] = [];
-      for (const c of parsed.data.candidates) {
-        const applied = applyPatch(incumbent, c.patch);
-        if (applied.changes.length === 0) continue; // nothing valid to test
-        const validated = StrategyParamsSchema.safeParse(applied.params);
-        if (!validated.success) continue;
-        candidates.push({
-          name: c.name,
-          hypothesis: c.hypothesis,
-          changes: [
-            ...applied.changes,
-            ...applied.rejected.map((r) => `rejected: ${r}`),
-          ],
-          params: validated.data,
-        });
-      }
-
-      if (candidates.length > 0) {
-        return { analysis: parsed.data.analysis, candidates, servedBy: model };
-      }
-      lastError = new Error("no candidate produced a valid parameter change");
-    } catch (err) {
-      lastError = err;
     }
-  }
 
-  throw lastError instanceof Error ? lastError : new Error("all models failed");
+    const candidates: ProposedCandidate[] = [];
+    for (const c of parsed.data.candidates) {
+      const applied = applyPatch(incumbent, c.patch);
+      if (applied.changes.length === 0) continue; // nothing valid to test
+      const validated = StrategyParamsSchema.safeParse(applied.params);
+      if (!validated.success) continue;
+      candidates.push({
+        name: c.name,
+        hypothesis: c.hypothesis,
+        changes: [
+          ...applied.changes,
+          ...applied.rejected.map((r) => `rejected: ${r}`),
+        ],
+        params: validated.data,
+      });
+    }
+    if (candidates.length === 0) {
+      throw new Error(`${model}: no candidate produced a valid parameter change`);
+    }
+    return { analysis: parsed.data.analysis, candidates, servedBy: served };
+  };
+
+  try {
+    // Resolves with the first attempt to succeed, and only rejects once they
+    // all have, so a slow primary never blocks a healthy failover.
+    return await Promise.any(MODELS.map((m, i) => attempt(m, i)));
+  } catch (err) {
+    const reasons =
+      err instanceof AggregateError
+        ? err.errors.map((e) => (e instanceof Error ? e.message : String(e))).join(" | ")
+        : err instanceof Error
+          ? err.message
+          : String(err);
+    throw new Error(`all models failed: ${reasons}`);
+  }
 }

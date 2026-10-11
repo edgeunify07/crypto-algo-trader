@@ -76,6 +76,14 @@ export interface StoredParams {
   };
 }
 
+/**
+ * Wall-clock allowance for a whole round.
+ *
+ * Under the platform's 60s function limit with headroom, because being killed
+ * mid-round loses the work and leaves the lock held until its TTL expires.
+ */
+const TOTAL_BUDGET_MS = Number(process.env.IMPROVE_BUDGET_MS ?? "52000");
+
 /** Minimum evidence a candidate needs before it can replace the incumbent. */
 const GUARDS = {
   minTrades: Number(process.env.IMPROVE_MIN_TRADES ?? "12"),
@@ -229,19 +237,58 @@ export async function runImprovement(options: ImproveOptions = {}): Promise<Impr
   const notes: string[] = [];
 
   const universe = await resolveUniverse();
+  // Wide enough that the ranking below has something to choose between. Two
+  // symbols — what this used to load — cannot be ranked at all, so a round
+  // scored itself on whichever pair happened to top the board today.
+  const poolSize = Number(process.env.IMPROVE_POOL_SIZE ?? "6");
   const symbols =
-    options.symbols ?? universe.entries.slice(0, 2).map((e) => e.symbol);
+    options.symbols ?? universe.entries.slice(0, poolSize).map((e) => e.symbol);
   const timeframes = options.timeframes ?? (["1h", "4h"] as Timeframe[]);
   const stepTimeframe = options.stepTimeframe ?? "1h";
-  const bars = options.bars ?? 500;
+  // ~33 days of 1h bars. Fewer and a round routinely produces under the
+  // twelve trades its own guardrail demands, so it can never promote
+  // anything; the whole loop then runs every hour and does nothing.
+  const bars = options.bars ?? 800;
 
   const incumbent = await loadParams();
   const data = await loadBacktestData(symbols, timeframes, bars);
 
-  const run = (p: StrategyParams) =>
-    runFuturesBacktest(data, p, { stepTimeframe, startingBalance: 100 });
+  const tradable = Math.max(1, Math.min(data.length - 1, Number(process.env.MAX_OPEN_POSITIONS ?? "3")));
+  const run = (p: StrategyParams, window: { from?: number; to?: number } = {}) =>
+    runFuturesBacktest(data, p, {
+      stepTimeframe,
+      startingBalance: 100,
+      universeSize: tradable,
+      ...window,
+    });
 
+  const incumbentRunStart = Date.now();
   const incumbentResult = run(incumbent.params);
+  // How long one backtest of this data costs, used to reserve time below.
+  const incumbentCostMs = Date.now() - incumbentRunStart;
+
+  /**
+   * The newer half of the loaded bars, kept back from the comparison that
+   * picks a winner.
+   *
+   * A candidate is chosen because it scored well on this exact data, so its
+   * score here is partly a measurement of the search. Re-checking it on the
+   * newer half before promoting costs one backtest and is the difference
+   * between "beat the incumbent" and "beat the incumbent in a way that held
+   * up on bars it was not selected over".
+   */
+  const stepBars = data.flatMap((d) => d.byTimeframe.get(stepTimeframe) ?? []);
+  const holdoutFrom =
+    stepBars.length > 0
+      ? (() => {
+          const first = Math.min(...stepBars.map((c) => c.closeTime));
+          const last = Math.max(...stepBars.map((c) => c.closeTime));
+          return first + (last - first) * 0.5;
+        })()
+      : undefined;
+  const holdout = (p: StrategyParams) =>
+    holdoutFrom === undefined ? null : run(p, { from: holdoutFrom });
+  const incumbentHoldout = holdout(incumbent.params);
   notes.push(
     `incumbent ${incumbent.version}: ${incumbentResult.trades.length} trades, ` +
       `${(incumbentResult.totalReturn * 100).toFixed(2)}%, fitness ${incumbentResult.fitness.toFixed(3)}`,
@@ -266,11 +313,33 @@ export async function runImprovement(options: ImproveOptions = {}): Promise<Impr
 
   let proposed: ProposedCandidate[] = [];
   try {
+    /**
+     * Whatever is left of the invocation, not a fixed slice.
+     *
+     * The fetch and the backtests either side of this vary with how many
+     * symbols and bars a round loads, and the platform kills the function at
+     * its wall-clock limit regardless. Handing the model a constant budget
+     * means either wasting time on a fast round or being killed mid-request
+     * on a slow one; deriving it from the clock makes the round degrade by
+     * asking for less thinking rather than by dying.
+     */
+    const spent = Date.now() - startedAt;
+    const llmBudget = Math.max(
+      8_000,
+      Math.min(
+        Number(process.env.LLM_BUDGET_MS ?? "44000"),
+        // Leave room for the candidate backtests and the held-out re-check,
+        // scaled by what the incumbent's own run just cost.
+        TOTAL_BUDGET_MS - spent - incumbentCostMs * ((options.candidates ?? 2) + 1),
+      ),
+    );
     const proposal = await proposeParams({
       report: buildReport(incumbentResult, incumbent.params, symbols),
       incumbent: incumbent.params,
       candidateCount: options.candidates ?? 2,
+      budgetMs: llmBudget,
     });
+    notes.push(`model budget ${(llmBudget / 1000).toFixed(0)}s after ${(spent / 1000).toFixed(0)}s of data and backtests`);
     proposed = proposal.candidates;
     report.servedBy = proposal.servedBy;
     report.analysis = proposal.analysis;
@@ -299,9 +368,37 @@ export async function runImprovement(options: ImproveOptions = {}): Promise<Impr
     });
   }
 
-  const winner = report.candidates
+  let winner: CandidateResult | undefined = report.candidates
     .filter((c) => c.rejectedBecause === null)
     .sort((a, b) => b.result.fitness - a.result.fitness)[0];
+
+  // The held-out re-check. A candidate that cannot carry its edge into the
+  // newer half is a reading of this window, not an improvement to the
+  // strategy, and promoting it would walk the live parameters steadily
+  // further into whatever the last few weeks happened to do.
+  if (winner && incumbentHoldout) {
+    const matching = proposed.find((c) => c.name === winner!.name);
+    const check = matching
+      ? holdout(sanitiseParams(StrategyParamsSchema.parse(matching.params)).params)
+      : null;
+    if (!check) {
+      notes.push(`"${winner.name}" could not be re-checked on the holdout; not promoting`);
+      winner = undefined;
+    } else if (check.totalReturn <= 0 || check.fitness < incumbentHoldout.fitness) {
+      const reason =
+        `held out: ${(check.totalReturn * 100).toFixed(2)}% over ${check.trades.length} trades ` +
+        `(incumbent ${(incumbentHoldout.totalReturn * 100).toFixed(2)}%)`;
+      notes.push(`rejected "${winner.name}" — ${reason}`);
+      const entry = report.candidates.find((c) => c.name === winner!.name);
+      if (entry) entry.rejectedBecause = reason;
+      winner = undefined;
+    } else {
+      notes.push(
+        `"${winner.name}" held up out of sample: ${(check.totalReturn * 100).toFixed(2)}% ` +
+          `over ${check.trades.length} trades`,
+      );
+    }
+  }
 
   if (winner && !options.dryRun) {
     const matching = proposed.find((p) => p.name === winner.name);
