@@ -199,6 +199,20 @@ export interface RunTickOptions {
   manageOnly?: boolean;
 }
 
+/**
+ * Move a fill price against the trader by `bps`.
+ *
+ * Mirrors the backtester exactly. A paper account filled at the mark is a
+ * paper account that flatters itself: no order ever gets the mark, and the
+ * difference always runs one way. `entering` says which way the order runs —
+ * opening a long buys, closing one sells.
+ */
+function slip(price: number, side: Side, entering: boolean, bps: number): number {
+  if (!(bps > 0)) return price;
+  const buying = entering === (side === "long");
+  return price * (1 + (buying ? 1 : -1) * (bps / 10_000));
+}
+
 export async function runTick(options: RunTickOptions = {}): Promise<TickResult> {
   const startedAt = Date.now();
   const store = kv();
@@ -352,7 +366,12 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         : mark >= position.liquidationPrice;
     if (hit) {
       // A liquidation takes the whole margin; the fill is at the liq price.
-      closePosition(position, position.liquidationPrice, "liquidation", 1);
+      closePosition(
+        position,
+        slip(position.liquidationPrice, position.side, false, params.execution.stopSlippageBps),
+        "liquidation",
+        1,
+      );
       notes.push(
         `${position.symbol}: LIQUIDATED at ${position.liquidationPrice.toFixed(6)}`,
       );
@@ -510,7 +529,14 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     const stopHit =
       position.side === "long" ? mark <= position.stopLoss : mark >= position.stopLoss;
     if (stopHit) {
-      closePosition(position, position.stopLoss, "stop_loss", 1);
+      // A stop trades into the move that triggered it, so it is priced more
+      // pessimistically than a calm exit.
+      closePosition(
+        position,
+        slip(position.stopLoss, position.side, false, params.execution.stopSlippageBps),
+        "stop_loss",
+        1,
+      );
       continue;
     }
 
@@ -576,7 +602,12 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     if (blended && params.exit.exitOnScoreFlip > 0) {
       const against = position.side === "long" ? -blended.score : blended.score;
       if (against >= params.exit.exitOnScoreFlip) {
-        closePosition(position, mark, "signal_flip", 1);
+        closePosition(
+          position,
+          slip(mark, position.side, false, params.execution.slippageBps),
+          "signal_flip",
+          1,
+        );
         continue;
       }
     }
@@ -587,7 +618,12 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     );
     const holdLimit = position.scalp ? params.scalp.maxHoldBars : params.exit.maxHoldBars;
     if (barsHeld >= holdLimit) {
-      closePosition(position, mark, position.scalp ? "scalp_timeout" : "max_hold", 1);
+      closePosition(
+        position,
+        slip(mark, position.side, false, params.execution.slippageBps),
+        position.scalp ? "scalp_timeout" : "max_hold",
+        1,
+      );
     }
   }
   positions = positions.filter((p) => p.quantity > 1e-12);
@@ -674,11 +710,19 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         if (nearestCycle > 0 && barsSinceAnchor > 0 && distance <= window) continue;
       }
 
-      const mark = markBySymbol[row.symbol];
-      if (!(mark > 0) || !(anchor.atr > 0)) {
+      const quoted = markBySymbol[row.symbol];
+      if (!(quoted > 0) || !(anchor.atr > 0)) {
         reject(row.symbol, "market data", "a mark price and ATR", "missing");
         continue;
       }
+      /**
+       * The price this would actually be filled at, not the mark.
+       *
+       * Everything below — the stop, the targets, the size, the liquidation
+       * price — is derived from this, so crossing the spread here is what
+       * makes the whole position honest rather than just its P&L.
+       */
+      const mark = slip(quoted, side, true, params.execution.slippageBps);
 
       /**
        * A scalp when the blend is unusually sure: tighter stop, a fixed

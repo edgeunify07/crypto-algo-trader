@@ -181,6 +181,34 @@ export const StrategyParamsSchema = z.object({
       closeFraction: 0.5,
     }),
 
+  /**
+   * How pessimistic to be about getting filled.
+   *
+   * Every fill here was at the mark price, which no real order ever gets.
+   * Measured against the live futures book on the symbols this trades, a $75
+   * market order costs a median of 0.46 bps from mid and 2.21 bps at worst —
+   * small, because the size is small relative to these books, but not zero
+   * and always against you.
+   *
+   * `stopSlippageBps` is larger for a reason that is not about size: a stop
+   * triggers precisely when the market is moving fast against the position,
+   * so it is the one order consistently filled into a thinning book. Pricing
+   * it the same as a calm entry is the single most flattering assumption a
+   * backtest can make.
+   *
+   * Resting take-profit limits take no slippage — they are filled at their
+   * price or not at all — but they are still charged the taker fee, which is
+   * conservative by about 3 bps a side.
+   */
+  execution: z
+    .object({
+      /** Basis points of adverse slippage on a market fill. */
+      slippageBps: z.number().min(0).max(100),
+      /** Basis points on a stop fill, which trades into a fast move. */
+      stopSlippageBps: z.number().min(0).max(300),
+    })
+    .default({ slippageBps: 2, stopSlippageBps: 15 }),
+
   risk: z.object({
     riskPerTrade: z.number().min(0.001).max(0.05),
     maxOpenPositions: z.number().int().min(1).max(20),
@@ -326,6 +354,12 @@ export const DEFAULT_PARAMS: StrategyParams = {
     maxHoldBars: 54,
     exitOnScoreFlip: 0.185211,
     useStructuralTargets: true,
+  },
+  execution: {
+    // Measured on the live book: 0.46 bps median, 2.21 worst, for $75.
+    slippageBps: 2,
+    // Stops fill into the move that triggered them; deliberately pessimistic.
+    stopSlippageBps: 15,
   },
   risk: {
     riskPerTrade: 0.01,
