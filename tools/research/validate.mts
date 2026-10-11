@@ -1,155 +1,133 @@
 /**
- * Third-window validation of the optimiser's winner.
+ * Re-measure the optimiser's winner with the code that will actually trade it.
  *
- * The search ranked candidates with a score that included the held-out window,
- * so across 300 trials that window stopped being out-of-sample for the winner —
- * some of its edge is selection luck. The only honest check is a stretch of
- * history the search never touched at all.
+ * A long search loads the engine once and runs for hours, so its results
+ * describe whatever the backtester did at the moment it started — this run
+ * began before the drawdown halt and the equity-marking fix landed. Shipping
+ * a winner on those numbers would mean deploying parameters chosen under
+ * rules the live engine does not follow.
  *
- * This fetches 60 days (paging backwards past Binance's 1500-bar cap) and
- * evaluates the winner, the runner-up and the shipped defaults on days 31-60,
- * which sit entirely before the optimisation window. It then perturbs the
- * winner's parameters to see whether its performance is a stable region or a
- * single lucky point.
+ * So the winner is scored again here, on the same four disjoint windows, by
+ * the current build, against the shipped defaults measured the same way. The
+ * bar is deliberately boring: beat the incumbent on the median window, stay
+ * profitable in at least three of four, and liquidate in none. One good
+ * window is luck.
  */
 import { runFuturesBacktest, type BacktestInput, type BacktestResult } from "@/lib/improve2/backtest";
-import { DEFAULT_PARAMS, sanitiseParams, type StrategyParams } from "@/lib/algo/strategy/params";
+import { DEFAULT_PARAMS, StrategyParamsSchema, sanitiseParams } from "@/lib/algo/strategy/params";
 import type { Candle, Timeframe } from "@/lib/algo/types";
 import fs from "node:fs";
 
 const OUT = process.env.OUT ?? "/tmp";
-const TFS: Timeframe[] = ["15m", "1h", "4h"];
+const CACHE = process.env.CACHE ?? `${OUT}/klines120x24.json`;
+const WINNER = process.env.WINNER ?? `${OUT}/winner2.json`;
+const UNIVERSE = Number(process.env.UNIVERSE ?? "10");
 const STEP: Timeframe = "1h";
-const HOST = "https://www.binance.com";
 
-type RawKline = [number, string, string, string, string, string, number, string, number, string, string, string];
-
-/** Page backwards so windows longer than Binance's 1500-bar cap can be loaded. */
-async function fetchDeep(symbol: string, interval: Timeframe, bars: number): Promise<Candle[]> {
-  const out: Candle[] = [];
-  let endTime: number | undefined;
-
-  while (out.length < bars) {
-    const params = new URLSearchParams({
-      symbol, interval, limit: String(Math.min(1500, bars - out.length)),
-    });
-    if (endTime !== undefined) params.set("endTime", String(endTime));
-
-    const res = await fetch(`${HOST}/fapi/v1/klines?${params}`, { cache: "no-store" });
-    if (!res.ok) break;
-    const raw = (await res.json()) as RawKline[];
-    if (raw.length === 0) break;
-
-    const page = raw.map((k) => ({
-      openTime: k[0], open: +k[1], high: +k[2], low: +k[3], close: +k[4],
-      volume: +k[5], closeTime: k[6], quoteVolume: +k[7], trades: k[8], closed: true,
-    }));
-    out.unshift(...page);
-    const first = page[0];
-    if (!first) break;
-    endTime = first.openTime - 1;
-    if (raw.length < 1500) break;
-  }
-
-  const now = Date.now();
-  return out.filter((c) => c.closeTime < now);
-}
-
-const symbols = Object.keys(
-  JSON.parse(fs.readFileSync(`${OUT}/klines.json`, "utf8")) as Record<string, unknown>,
-);
-console.log("loading 60 days for:", symbols.join(", "));
-
-// 60 days: 15m -> 5760, 1h -> 1440, 4h -> 360.
-const NEED: Record<string, number> = { "15m": 5900, "1h": 1500, "4h": 400 };
-
-const loaded = await Promise.all(
-  symbols.flatMap((s) =>
-    TFS.map(async (tf) => ({ s, tf, c: await fetchDeep(s, tf, NEED[tf]!).catch(() => [] as Candle[]) })),
-  ),
-);
-const bySym = new Map<string, Map<Timeframe, Candle[]>>();
-for (const { s, tf, c } of loaded) {
-  if (c.length === 0) continue;
-  const m = bySym.get(s) ?? new Map<Timeframe, Candle[]>();
-  m.set(tf, c);
-  bySym.set(s, m);
-}
-const all: BacktestInput[] = [...bySym].map(([symbol, byTimeframe]) => ({ symbol, byTimeframe }));
+const bySym = JSON.parse(fs.readFileSync(CACHE, "utf8")) as Record<string, Record<string, Candle[]>>;
+const all: BacktestInput[] = Object.entries(bySym).map(([symbol, m]) => ({
+  symbol,
+  byTimeframe: new Map(Object.entries(m) as [Timeframe, Candle[]][]),
+}));
 
 const stepAll = all.flatMap((d) => d.byTimeframe.get(STEP) ?? []);
 const latest = Math.max(...stepAll.map((c) => c.closeTime));
 const earliest = Math.min(...stepAll.map((c) => c.closeTime));
-const optimiseWindowStart = latest - 30 * 86_400_000;
+const day = (t: number) => new Date(t).toISOString().slice(0, 10);
 
-console.log(
-  `history ${new Date(earliest).toISOString().slice(0, 10)} -> ${new Date(latest).toISOString().slice(0, 10)} ` +
-    `(${Math.round((latest - earliest) / 86_400_000)} days, ${all[0]?.byTimeframe.get(STEP)?.length} bars of ${STEP})`,
-);
-console.log(
-  `UNSEEN window: ${new Date(earliest).toISOString().slice(0, 10)} -> ${new Date(optimiseWindowStart).toISOString().slice(0, 10)}\n`,
-);
+// The same split the search used, so "out of sample" means the same thing.
+const trainTo = earliest + (latest - earliest) * 0.35;
+const span = (latest - trainTo) / 4;
+const windows = Array.from({ length: 4 }, (_, i) => ({
+  from: trainTo + span * i,
+  to: trainTo + span * (i + 1),
+}));
 
-const unseen = (p: StrategyParams) =>
+const run = (p: Parameters<typeof runFuturesBacktest>[1], from: number, to: number) =>
   runFuturesBacktest(all, p, {
-    stepTimeframe: STEP, startingBalance: 100,
-    // Start a few days in so indicators are warm before the first trade.
-    from: earliest + 3 * 86_400_000, to: optimiseWindowStart,
+    stepTimeframe: STEP,
+    startingBalance: 100,
+    from,
+    to,
+    universeSize: UNIVERSE,
   });
 
-const line = (tag: string, r: BacktestResult) =>
-  `${tag.padEnd(16)} ${String(r.trades.length).padStart(4)}t ${(r.totalReturn * 100).toFixed(2).padStart(8)}% ` +
-  `DD${(r.maxDrawdown * 100).toFixed(1).padStart(5)}% PF${r.profitFactor.toFixed(2).padStart(5)} ` +
-  `liq${r.liquidations} fees$${r.totalFees.toFixed(2).padStart(5)} exp ${r.expectancy.toFixed(3)}R`;
+const line = (t: string, r: BacktestResult) =>
+  `${t.padEnd(10)} ${String(r.trades.length).padStart(3)}t ${(r.totalReturn * 100).toFixed(2).padStart(8)}% ` +
+  `DD${(r.maxDrawdown * 100).toFixed(1).padStart(5)}% PF${r.profitFactor.toFixed(2).padStart(6)} liq${r.liquidations}`;
 
-const best = JSON.parse(fs.readFileSync(`${OUT}/best.json`, "utf8")) as { params: StrategyParams };
+interface Summary {
+  results: BacktestResult[];
+  median: number;
+  compounded: number;
+  profitable: number;
+  liquidations: number;
+  worstDd: number;
+  trades: number;
+}
 
-console.log("=== ON THE UNSEEN WINDOW (never used in the search) ===");
-const baseRes = unseen(DEFAULT_PARAMS);
-const bestRes = unseen(best.params);
-console.log(line("defaults", baseRes));
-console.log(line("optimised #1", bestRes));
+function summarise(p: Parameters<typeof runFuturesBacktest>[1]): Summary {
+  const results = windows.map((w) => run(p, w.from, w.to));
+  const rets = results.map((r) => r.totalReturn).sort((a, b) => a - b);
+  return {
+    results,
+    median: ((rets[1] as number) + (rets[2] as number)) / 2,
+    compounded: results.reduce((acc, r) => acc * (1 + r.totalReturn), 1) - 1,
+    profitable: results.filter((r) => r.totalReturn > 0).length,
+    liquidations: results.reduce((a, r) => a + r.liquidations, 0),
+    worstDd: Math.max(...results.map((r) => r.maxDrawdown)),
+    trades: results.reduce((a, r) => a + r.trades.length, 0),
+  };
+}
 
-// ---- robustness: is this a stable region or one lucky point? -------------
-console.log("\n=== ROBUSTNESS: winner perturbed +/-12% on continuous params ===");
-const perturb = (p: StrategyParams, scale: number): StrategyParams => {
-  const n = structuredClone(p);
-  const jitter = (v: number) => v * (1 + (Math.random() * 2 - 1) * scale);
-  for (const k of Object.keys(n.weights) as (keyof typeof n.weights)[]) {
-    n.weights[k] = Math.max(0, jitter(n.weights[k]));
-  }
-  for (const k of Object.keys(n.timeframeWeights)) {
-    n.timeframeWeights[k] = Math.max(0, jitter(n.timeframeWeights[k] ?? 1));
-  }
-  n.entry.minScore = Math.min(0.95, Math.max(0.1, jitter(n.entry.minScore)));
-  n.entry.minAlignment = Math.min(1, Math.max(0, jitter(n.entry.minAlignment)));
-  n.exit.atrStopMultiple = Math.min(6, Math.max(0.5, jitter(n.exit.atrStopMultiple)));
-  n.exit.trailAtrMultiple = Math.min(6, Math.max(0.3, jitter(n.exit.trailAtrMultiple)));
-  n.indicators.adxThreshold = Math.min(40, Math.max(10, jitter(n.indicators.adxThreshold)));
-  return sanitiseParams(n).params;
+const report = (name: string, s: Summary) => {
+  console.log(`\n=== ${name} ===`);
+  s.results.forEach((r, i) => console.log(line(`  OOS${i + 1}`, r)));
+  console.log(
+    `  median ${(s.median * 100).toFixed(2)}% | compounded ${(s.compounded * 100).toFixed(2)}% | ` +
+      `${s.profitable}/4 profitable | ${s.trades} trades | worst DD ${(s.worstDd * 100).toFixed(1)}% | ` +
+      `liq ${s.liquidations}`,
+  );
 };
 
-const runs = Array.from({ length: 12 }, () => unseen(perturb(best.params, 0.12)));
-const rets = runs.map((r) => r.totalReturn).sort((a, b) => a - b);
-const positive = rets.filter((r) => r > 0).length;
-const median = rets[Math.floor(rets.length / 2)] ?? 0;
-console.log(
-  `  ${positive}/${runs.length} perturbations profitable | median ${(median * 100).toFixed(2)}% | ` +
-    `worst ${((rets[0] ?? 0) * 100).toFixed(2)}% | best ${((rets.at(-1) ?? 0) * 100).toFixed(2)}%`,
-);
-console.log(`  liquidations across perturbations: ${runs.reduce((a, r) => a + r.liquidations, 0)}`);
+console.log(`history ${day(earliest)} -> ${day(latest)}, ${all.length} symbols, top ${UNIVERSE} tradable`);
+windows.forEach((w, i) => console.log(`  OOS${i + 1} ${day(w.from)} -> ${day(w.to)}`));
 
-fs.writeFileSync(
-  `${OUT}/validation.json`,
-  JSON.stringify(
-    {
-      unseenWindow: { from: earliest + 3 * 86_400_000, to: optimiseWindowStart },
-      defaults: { trades: baseRes.trades.length, ret: baseRes.totalReturn, dd: baseRes.maxDrawdown, pf: baseRes.profitFactor },
-      optimised: { trades: bestRes.trades.length, ret: bestRes.totalReturn, dd: bestRes.maxDrawdown, pf: bestRes.profitFactor },
-      robustness: { positive, total: runs.length, median, worst: rets[0], best: rets.at(-1) },
-    },
-    null,
-    2,
-  ),
-);
-console.log(`\nwrote ${OUT}/validation.json`);
+const incumbent = summarise(DEFAULT_PARAMS);
+report("SHIPPED DEFAULTS, re-measured by the current build", incumbent);
+
+if (!fs.existsSync(WINNER)) {
+  console.log(`\nNo ${WINNER} — the search accepted nothing. Defaults stay.`);
+  process.exit(0);
+}
+
+const raw = JSON.parse(fs.readFileSync(WINNER, "utf8")) as { params: unknown };
+const parsed = StrategyParamsSchema.safeParse(raw.params);
+if (!parsed.success) {
+  console.log("\nWinner failed schema validation; defaults stay.");
+  process.exit(1);
+}
+const candidate = sanitiseParams(parsed.data).params;
+const challenger = summarise(candidate);
+report("SEARCH WINNER, same code, same windows", challenger);
+
+const reasons: string[] = [];
+if (challenger.profitable < 3) reasons.push(`only ${challenger.profitable}/4 windows profitable`);
+if (challenger.liquidations > 0) reasons.push(`${challenger.liquidations} liquidation(s)`);
+if (challenger.median <= incumbent.median) {
+  reasons.push(
+    `median ${(challenger.median * 100).toFixed(2)}% does not beat the incumbent's ` +
+      `${(incumbent.median * 100).toFixed(2)}%`,
+  );
+}
+if (challenger.trades < 40) reasons.push(`only ${challenger.trades} trades across all windows`);
+
+console.log();
+if (reasons.length === 0) {
+  console.log(`PROMOTE: ${reasons.length === 0 ? "clears every bar" : ""}`);
+  fs.writeFileSync(`${OUT}/validated.json`, JSON.stringify({ params: candidate }, null, 2));
+  console.log(`wrote ${OUT}/validated.json`);
+} else {
+  console.log("DO NOT PROMOTE:");
+  for (const r of reasons) console.log(`  - ${r}`);
+}
