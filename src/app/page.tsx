@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import Chart from "./Chart";
+import TradingViewChart from "./TradingViewChart";
 import BacktestPanel from "./BacktestPanel";
 import { useBinanceStream } from "./useBinanceStream";
 import {
@@ -262,6 +263,13 @@ export default function Home() {
   const [picked, setPicked] = useState<string | null>(null);
   const symbol = picked ?? rows[0]?.symbol ?? "BTCUSDT";
   const [chartTf, setChartTf] = useState("1h");
+  /**
+   * Which chart to show. TradingView by default because it streams from its
+   * own domain and therefore moves wherever the page loads; the engine's own
+   * chart needs this browser to reach Binance's websocket, which is blocked
+   * in some regions and goes quiet rather than failing.
+   */
+  const [chartSource, setChartSource] = useState<"tradingview" | "engine">("tradingview");
   const selectSymbol = useCallback((s: string) => setPicked(s), []);
 
   // Live market data straight from the exchange. The polled book stays as a
@@ -477,12 +485,14 @@ export default function Home() {
                 ))}
               </div>
               {selectedRow && <SignalHeadline row={selectedRow} />}
-              <Chart
+              <ChartSwitch
                 symbol={symbol}
-                liveKline={stream.kline}
-                mark={stream.mark}
+                timeframe={chartTf}
                 onTimeframe={setChartTf}
+                stream={stream}
                 streaming={streaming}
+                source={chartSource}
+                onSource={setChartSource}
               />
               <BacktestPanel days={30} />
               <LiveTab positions={state?.positions ?? []} />
@@ -526,12 +536,14 @@ export default function Home() {
                 </button>
               ))}
             </div>
-            <Chart
+            <ChartSwitch
               symbol={symbol}
-              liveKline={stream.kline}
-              mark={stream.mark}
+              timeframe={chartTf}
               onTimeframe={setChartTf}
+              stream={stream}
               streaming={streaming}
+              source={chartSource}
+              onSource={setChartSource}
             />
             <div className="grid gap-2 sm:grid-cols-2 lg:hidden">
               <OrderBook book={book} symbol={symbol} />
@@ -556,9 +568,81 @@ export default function Home() {
 }
 
 /** The single strongest signal, summarised above its chart. */
+/**
+ * The two charts, and the toggle between them.
+ *
+ * They answer different questions. TradingView shows the market as everyone
+ * else sees it, streaming from its own servers. The engine view shows the
+ * exact series the strategy decided on — its tuned moving averages, its
+ * pivots, its fills — which is what you want when asking why it traded, and
+ * which no third-party chart can show.
+ */
+function ChartSwitch({
+  symbol,
+  timeframe,
+  onTimeframe,
+  stream,
+  streaming,
+  source,
+  onSource,
+}: {
+  symbol: string;
+  timeframe: string;
+  onTimeframe: (tf: string) => void;
+  stream: ReturnType<typeof useBinanceStream>;
+  streaming: boolean;
+  source: "tradingview" | "engine";
+  onSource: (s: "tradingview" | "engine") => void;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center gap-1">
+        {(
+          [
+            ["tradingview", "Live chart"],
+            ["engine", "Engine view"],
+          ] as const
+        ).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => onSource(key)}
+            className={`rounded-lg px-2.5 py-1 text-[11px] font-medium ${
+              source === key
+                ? "bg-[var(--surface-2)] text-[var(--text)]"
+                : "bg-[var(--surface)] text-[var(--muted)]"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+        <span className="ml-auto text-[9px] text-[var(--muted)]">
+          {source === "tradingview"
+            ? "TradingView's feed and indicators"
+            : streaming
+              ? "the strategy's own series, live"
+              : "the strategy's own series, server-polled"}
+        </span>
+      </div>
+      {source === "tradingview" ? (
+        <TradingViewChart symbol={symbol} timeframe={timeframe} onTimeframe={onTimeframe} />
+      ) : (
+        <Chart
+          symbol={symbol}
+          liveKline={stream.kline}
+          mark={stream.mark}
+          onTimeframe={onTimeframe}
+          streaming={streaming}
+        />
+      )}
+    </div>
+  );
+}
+
 function SignalHeadline({ row }: { row: ScreenerRow }) {
   const long = row.direction === "long";
   const flat = row.direction === "flat";
+  const name = row.symbol.replace("USDT", "");
+  const failing = row.gates.filter((g) => !g.passed);
   return (
     <div className="rounded-xl bg-[var(--surface)] px-3 py-2.5">
       <div className="flex items-center justify-between">
@@ -585,17 +669,39 @@ function SignalHeadline({ row }: { row: ScreenerRow }) {
           {row.score >= 0 ? "+" : ""}{row.score.toFixed(2)}
         </span>
       </div>
-      <div className="mt-1.5 text-[10px]">
+      {/*
+        What the engine is doing about this symbol, in words rather than
+        jargon. "waiting on signal strength · 1/4 conditions met" is accurate
+        and tells you nothing you can act on: it never says what the number
+        is, what it would have to be, or when anything happens next.
+      */}
+      <div className="mt-1.5 space-y-1 text-[10px]">
         {row.hasPosition ? (
-          <span className="text-[var(--accent)]">position open</span>
-        ) : row.blockedBy ? (
-          <span className="text-[var(--muted)]">
-            waiting on <span className="text-[var(--warn)]">{row.blockedBy}</span>
-            {" · "}
-            {row.gates.filter((g) => g.passed).length}/{row.gates.length} conditions met
+          <span className="text-[var(--accent)]">
+            Position open — the engine is managing its stop and targets.
           </span>
+        ) : failing.length > 0 ? (
+          <>
+            <span className="text-[var(--muted)]">
+              Not trading {name}: {failing.length === 1 ? "one check" : `${failing.length} checks`} of{" "}
+              {row.gates.length} {failing.length === 1 ? "fails" : "fail"}.
+            </span>
+            <div className="space-y-0.5">
+              {failing.slice(0, 3).map((g) => (
+                <div key={g.name} className="flex items-baseline gap-1.5">
+                  <span className="text-[var(--down)]">✕</span>
+                  <span className="text-[var(--muted)]">{g.name}</span>
+                  <span className="tnum text-[var(--text)]">{g.actual}</span>
+                  <span className="text-[var(--muted)]">needs {g.required}</span>
+                </div>
+              ))}
+            </div>
+          </>
         ) : (
-          <span className="text-[var(--up)]">all conditions met — trades on the next tick</span>
+          <span className="text-[var(--up)]">
+            {name} passes all {row.gates.length} checks. The engine opens the position on its
+            next run — within 5 minutes, or seconds while this page is open.
+          </span>
         )}
       </div>
     </div>

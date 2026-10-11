@@ -97,7 +97,16 @@ const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
  * The server poll now only refreshes closed history and the analysis — the
  * websocket carries the live bar — so it can be slow and cheap.
  */
+/**
+ * How often the server candles are refetched.
+ *
+ * When the websocket is delivering, the forming bar moves on every tick and
+ * this poll only needs to correct the closed history. When it is not — a
+ * region where Binance's stream is blocked, a network that drops it — this
+ * poll is the only thing moving the chart at all, so it runs much more often.
+ */
 const REFRESH_MS = 15_000;
+const REFRESH_MS_NO_SOCKET = 4_000;
 
 const UP = "#22c98b";
 const DOWN = "#ff5570";
@@ -164,13 +173,13 @@ export default function Chart({
       setLoading(true);
       void load();
     }, 0);
-    const id = setInterval(load, REFRESH_MS);
+    const id = setInterval(load, streaming ? REFRESH_MS : REFRESH_MS_NO_SOCKET);
     return () => {
       cancelled = true;
       clearTimeout(kick);
       clearInterval(id);
     };
-  }, [symbol, timeframe]);
+  }, [symbol, timeframe, streaming]);
 
   /**
    * Server candles with the websocket bar merged in.
@@ -261,7 +270,23 @@ export default function Chart({
       return d;
     };
 
-    return { W, H, PAD_R, PAD_B, x, y, bw, path, hi, lo, n };
+    /**
+     * Evenly spaced prices for the scale, snapped to readable steps.
+     *
+     * Dividing the range into equal parts gives labels like 109.3471, which
+     * nobody reads; the step is rounded to a 1/2/5 multiple of its own
+     * magnitude so the numbers land where the eye expects them.
+     */
+    const top = hi + pad;
+    const bottom = lo - pad;
+    const rough = (top - bottom) / 5;
+    const magnitude = 10 ** Math.floor(Math.log10(rough || 1));
+    const step =
+      [1, 2, 5, 10].map((m) => m * magnitude).find((v) => v >= rough) ?? magnitude * 10;
+    const scale: number[] = [];
+    for (let v = Math.ceil(bottom / step) * step; v <= top; v += step) scale.push(v);
+
+    return { W, H, PAD_R, PAD_B, x, y, bw, path, hi, lo, n, scale };
   }, [merged]);
 
   return (
@@ -308,6 +333,36 @@ export default function Chart({
             style={{ height: 210 }}
             preserveAspectRatio="none"
           >
+            {/*
+              Price scale.
+
+              Without it the chart has a right-hand gutter holding a tag for
+              the last price and nothing else, so every other candle has to be
+              eyeballed against that single number — the view shows the shape
+              of the move but never says what any level is worth.
+            */}
+            {geom.scale.map((p) => (
+              <g key={p}>
+                <line
+                  x1={0}
+                  x2={geom.W - geom.PAD_R}
+                  y1={geom.y(p)}
+                  y2={geom.y(p)}
+                  stroke="#1c2433"
+                  strokeWidth={1}
+                />
+                <text
+                  x={geom.W - geom.PAD_R + 5}
+                  y={geom.y(p) + 3.5}
+                  fill={MUTED}
+                  fontSize={9}
+                  fontFamily="ui-monospace, monospace"
+                >
+                  {fmt(p)}
+                </text>
+              </g>
+            ))}
+
             {/* Bollinger envelope */}
             <path d={geom.path(merged.indicators.bbUpper)} fill="none" stroke="#3a4a63" strokeWidth={1.2} />
             <path d={geom.path(merged.indicators.bbLower)} fill="none" stroke="#3a4a63" strokeWidth={1.2} />
