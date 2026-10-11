@@ -235,7 +235,7 @@ export function runFuturesBacktest(
     entry: number;
     margin: number;
     stop: number;
-    targets: { price: number; fraction: number; hit: boolean }[];
+    targets: { price: number; fraction: number; hit: boolean; scalp?: boolean }[];
     liq: number;
     extreme: number;
     entryFee: number;
@@ -418,7 +418,7 @@ export function runFuturesBacktest(
               d.symbol,
               st,
               tp.price,
-              open.scalp ? "scalp_target" : "take_profit",
+              tp.scalp ? "scalp_target" : "take_profit",
               tp.fraction,
               nextBar.closeTime,
             );
@@ -556,9 +556,19 @@ export function runFuturesBacktest(
                   side === "long"
                     ? price * (1 + params.scalp.targetPct)
                     : price * (1 - params.scalp.targetPct),
-                fraction: 1,
+                fraction: params.scalp.closeFraction,
                 hit: false,
+                scalp: true,
               },
+              // Whatever the scalp leaves behind rides the swing ladder.
+              ...(params.scalp.closeFraction < 1
+                ? params.exit.takeProfitRMultiples.map((r, i) => ({
+                    price: side === "long" ? price + stopDistance * r : price - stopDistance * r,
+                    fraction:
+                      (params.exit.takeProfitFractions[i] ?? 0) * (1 - params.scalp.closeFraction),
+                    hit: false,
+                  })).filter((t) => t.fraction > 0)
+                : []),
             ]
           : params.exit.takeProfitRMultiples
               .map((r, i) => ({

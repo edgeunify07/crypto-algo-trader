@@ -25,7 +25,13 @@ export interface FuturesPosition {
   leverage: number;
   openedAt: number;
   stopLoss: number;
-  takeProfits: { price: number; fraction: number; hit: boolean }[];
+  /**
+   * `scalp` marks the fixed-percentage target, so the ladder the remainder
+   * rides is not tallied under the scalp's name. Labelling by the position
+   * instead made every swing exit on a part-closed scalp read as a scalp
+   * exit, which is precisely the comparison the two reasons exist to allow.
+   */
+  takeProfits: { price: number; fraction: number; hit: boolean; scalp?: boolean }[];
   liquidationPrice: number;
   /** Best price seen since entry; drives the trailing stop. */
   extreme: number;

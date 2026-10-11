@@ -203,8 +203,12 @@ describe("runFuturesBacktest scalp rule", () => {
   const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
   const data = [input("A", rising(600)), input("B", rising(600).slice(40))];
 
-  it("closes the whole position at the configured move", () => {
-    const r = runFuturesBacktest(data, withScalp({ targetPct: 0.03 }), common);
+  it("exits at the configured move, and labels only that exit as the scalp's", () => {
+    const r = runFuturesBacktest(
+      data,
+      withScalp({ targetPct: 0.03, closeFraction: 1 }),
+      common,
+    );
     const hits = r.trades.filter((t) => t.exitReason === "scalp_target");
     expect(hits.length).toBeGreaterThan(0);
     for (const t of hits) {
@@ -216,9 +220,34 @@ describe("runFuturesBacktest scalp rule", () => {
     }
   });
 
+  it("leaves the rest on the swing ladder when it closes only part", () => {
+    const r = runFuturesBacktest(
+      data,
+      withScalp({ targetPct: 0.03, closeFraction: 0.5 }),
+      common,
+    );
+    const scalpExits = r.trades.filter((t) => t.exitReason === "scalp_target");
+    expect(scalpExits.length).toBeGreaterThan(0);
+    // The scalp's own exit still lands exactly on its target...
+    for (const t of scalpExits) {
+      const move =
+        t.side === "long"
+          ? (t.exitPrice - t.entryPrice) / t.entryPrice
+          : (t.entryPrice - t.exitPrice) / t.entryPrice;
+      expect(move).toBeCloseTo(0.03, 6);
+    }
+    // ...and the remainder leaves under a different name, which is the whole
+    // point of giving the scalp its own exit reasons.
+    expect(r.trades.some((t) => !t.exitReason.startsWith("scalp_"))).toBe(true);
+  });
+
   it("gives up on its own clock, not the swing one", () => {
     // Far enough away that the clock runs out first.
-    const r = runFuturesBacktest(data, withScalp({ targetPct: 0.45, maxHoldBars: 6 }), common);
+    const r = runFuturesBacktest(
+      data,
+      withScalp({ targetPct: 0.45, maxHoldBars: 6, closeFraction: 1 }),
+      common,
+    );
     const timeouts = r.trades.filter((t) => t.exitReason === "scalp_timeout");
     expect(timeouts.length).toBeGreaterThan(0);
     // The swing limit is far longer, so nothing should exit under its name.
@@ -230,9 +259,10 @@ describe("runFuturesBacktest scalp rule", () => {
     expect(off.trades.some((t) => t.exitReason.startsWith("scalp_"))).toBe(false);
   });
 
-  it("leaves the swing book alone at a threshold confidence never reaches", () => {
-    // The shipped default. Confidence topped out at 0.858 over 120 days and
-    // 24 symbols, so on this synthetic series it must not fire at all.
+  it("does not disturb the swing book at the shipped threshold", () => {
+    // The shipped config is selective enough that it never triggers on this
+    // series, so the swing results have to come out bit-identical. If a
+    // future retune makes it fire here, this is the test that notices.
     const shipped = runFuturesBacktest(
       data,
       { ...TRADES_READILY, scalp: DEFAULT_PARAMS.scalp },
