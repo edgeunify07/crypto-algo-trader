@@ -149,6 +149,67 @@ export function newAccount(startingBalance = STARTING_BALANCE): AccountState {
   };
 }
 
+/**
+ * The two books, each funded and measured on its own.
+ *
+ * The engines used to share one balance, carved by `scalp.capitalShare`. That
+ * made them independent in slots but not in results: a swing drawdown shrank
+ * what the scalp could size against, and one equity curve could not say which
+ * engine earned or lost the money. Two accounts of their own make the
+ * comparison the split exists for an actual measurement — each starts at the
+ * same stake and is judged on what it does with it.
+ */
+export interface Books {
+  swing: AccountState;
+  scalp: AccountState;
+}
+
+export function newBooks(startingBalance = STARTING_BALANCE): Books {
+  return { swing: newAccount(startingBalance), scalp: newAccount(startingBalance) };
+}
+
+/**
+ * Read the books, migrating a single-account deployment on the way.
+ *
+ * Everything the old account traded was the swing engine's — the scalp was
+ * switched off for all but the last few minutes of its life — so it becomes
+ * the swing book unchanged, keeping its history, and the scalp starts fresh
+ * at the same stake. Splitting one curve down the middle would invent a
+ * past neither engine had.
+ */
+export function booksFrom(
+  stored: Books | null | undefined,
+  legacy: AccountState | null | undefined,
+  startingBalance = STARTING_BALANCE,
+): Books {
+  if (stored?.swing && stored?.scalp) return stored;
+  if (legacy) return { swing: legacy, scalp: newAccount(startingBalance) };
+  return newBooks(startingBalance);
+}
+
+/**
+ * Refresh a combined view from the two books.
+ *
+ * The money fields are plain sums, recomputed rather than stored, so the
+ * pair can never drift from its parts. Everything else — when the deployment
+ * started, how many ticks it has run, the peak equity its curve is drawn
+ * against — belongs to the pair and is kept as it was.
+ */
+export function syncCombined(combined: AccountState, books: Books): AccountState {
+  combined.balance = books.swing.balance + books.scalp.balance;
+  combined.startingBalance = books.swing.startingBalance + books.scalp.startingBalance;
+  combined.realisedPnl = books.swing.realisedPnl + books.scalp.realisedPnl;
+  combined.totalFees = books.swing.totalFees + books.scalp.totalFees;
+  combined.totalFunding = books.swing.totalFunding + books.scalp.totalFunding;
+  // Halted only while neither engine may trade; one book sitting out is not
+  // the deployment stopping.
+  combined.haltedReason =
+    books.swing.haltedReason && books.scalp.haltedReason
+      ? `swing: ${books.swing.haltedReason}; scalp: ${books.scalp.haltedReason}`
+      : null;
+  return combined;
+}
+
 /** Margin locked across all open positions. */
 export function lockedMargin(positions: FuturesPosition[]): number {
   return positions.reduce((sum, p) => sum + p.margin, 0);

@@ -122,6 +122,23 @@ interface State {
     lastTickAt: number;
     haltedReason: string | null;
   };
+  /** Each engine's own account, each started on the same stake. */
+  books?: Record<
+    "swing" | "scalp",
+    {
+      balance: number;
+      startingBalance: number;
+      equity: number;
+      unrealised: number;
+      realisedPnl: number;
+      totalFees: number;
+      drawdown: number;
+      returnPct: number;
+      positions: number;
+      trades: number;
+      haltedReason: string | null;
+    }
+  >;
   positions: Position[];
   stats: {
     trades: number;
@@ -204,6 +221,8 @@ export default function Home() {
     "swing",
   );
   const [expanded, setExpanded] = useState<string | null>(null);
+  /** Which engine's reading the Signals tab shows. */
+  const [scanEngine, setScanEngine] = useState<"swing" | "scalp">("swing");
   const [ticking, setTicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastTick, setLastTick] = useState<number>(0);
@@ -621,6 +640,7 @@ export default function Home() {
                 engine={tab}
                 positions={tab === "swing" ? swingPositions : scalpPositions}
                 scalp={strategy?.scalp}
+                book={state?.books?.[tab]}
               />
             </div>
 
@@ -637,6 +657,8 @@ export default function Home() {
         {tab === "scan" && (
           <ScanTab
             rows={rows}
+            engine={scanEngine}
+            onEngine={setScanEngine}
             expanded={expanded}
             setExpanded={setExpanded}
             onChart={(sym) => {
@@ -958,10 +980,12 @@ function EngineTab({
   engine,
   positions,
   scalp,
+  book,
 }: {
   engine: "swing" | "scalp";
   positions: Position[];
   scalp: StrategyInfo["scalp"];
+  book: NonNullable<State["books"]>["swing"] | undefined;
 }) {
   const unrealised = positions.reduce((a, r) => a + r.unrealised, 0);
   const off = engine === "scalp" && scalp?.enabled === false;
@@ -980,6 +1004,35 @@ function EngineTab({
           <span className={`tnum text-[11px] ${tone(unrealised)}`}>{signed(unrealised)}</span>
         )}
       </div>
+
+      {/*
+        This engine's own money.
+
+        The two used to share one balance carved by a percentage, so a swing
+        drawdown quietly shrank what the scalp could size against and one
+        equity figure could not say which engine earned it. Each now starts
+        on its own stake and is judged on what it does with it.
+      */}
+      {book && (
+        <div className="grid grid-cols-4 gap-2 rounded-xl bg-[var(--surface)] px-3 py-2.5">
+          {[
+            ["equity", `$${book.equity.toFixed(2)}`, tone(book.equity - book.startingBalance)],
+            ["return", `${book.returnPct >= 0 ? "+" : ""}${(book.returnPct * 100).toFixed(2)}%`, tone(book.returnPct)],
+            ["free", `$${book.balance.toFixed(2)}`, ""],
+            ["trades", String(book.trades), ""],
+          ].map(([label, value, cls]) => (
+            <div key={label}>
+              <div className="text-[9px] uppercase tracking-wide text-[var(--muted)]">{label}</div>
+              <div className={`tnum text-[12px] ${cls}`}>{value}</div>
+            </div>
+          ))}
+          {book.haltedReason && (
+            <div className="col-span-4 text-[10px] text-[var(--down)]">
+              halted — {book.haltedReason}
+            </div>
+          )}
+        </div>
+      )}
 
       {off ? (
         <div className="rounded-xl bg-[var(--surface)] px-3 py-3 text-[11px] leading-relaxed text-[var(--muted)]">
@@ -1094,29 +1147,110 @@ function Cell({ label, value, cls }: { label: string; value: string; cls?: strin
   );
 }
 
+/**
+ * One engine's reading of a symbol.
+ *
+ * The scalp publishes its own score, confidence, alignment and gates from its
+ * own blend; when it is switched off it publishes nothing, and the swing read
+ * stands in so the row still renders rather than collapsing to zeroes that
+ * look like a flat market.
+ */
+function read(r: ScreenerRow, engine: "swing" | "scalp") {
+  if (engine === "scalp" && r.scalp) {
+    return {
+      score: r.scalp.score,
+      confidence: r.scalp.confidence,
+      alignment: r.scalp.alignment,
+      gates: r.scalp.gates,
+      blockedBy: r.scalp.blockedBy,
+    };
+  }
+  return {
+    score: r.score,
+    confidence: r.confidence,
+    alignment: r.alignment,
+    gates: r.gates,
+    blockedBy: r.blockedBy,
+  };
+}
+
+/**
+ * Signals, read through one engine's eyes.
+ *
+ * The two engines reach different verdicts on the same symbol — they blend
+ * different timeframes and hold different gates — so one list ordered by the
+ * swing score buried whatever the scalp liked. Each engine now ranks and
+ * explains the market itself, and the row says which engine's reading is on
+ * screen rather than leaving it to be inferred.
+ */
 function ScanTab({
   rows,
   expanded,
   setExpanded,
   onChart,
+  engine,
+  onEngine,
 }: {
   rows: ScreenerRow[];
   expanded: string | null;
   setExpanded: (s: string | null) => void;
   onChart: (symbol: string) => void;
+  engine: "swing" | "scalp";
+  onEngine: (e: "swing" | "scalp") => void;
 }) {
+  const picker = (
+    <div className="flex gap-1 pb-2">
+      {(["swing", "scalp"] as const).map((e) => (
+        <button
+          key={e}
+          onClick={() => onEngine(e)}
+          className={`flex-1 rounded-lg py-1.5 text-[11px] font-medium ${
+            engine === e
+              ? "bg-[var(--surface-2)] text-[var(--text)]"
+              : "bg-[var(--surface)] text-[var(--muted)]"
+          }`}
+        >
+          {e === "swing" ? "Swing · 1h 4h 1d" : "Scalp · 15m 1h"}
+        </button>
+      ))}
+    </div>
+  );
+
   if (rows.length === 0) {
-    return <Empty>Waiting for the first scan of today&apos;s top-10 by volume…</Empty>;
+    return (
+      <>
+        {picker}
+        <Empty>Waiting for the first scan of today&apos;s top-10 by volume…</Empty>
+      </>
+    );
+  }
+  if (engine === "scalp" && rows.every((r) => !r.scalp)) {
+    return (
+      <>
+        {picker}
+        <Empty>
+          The scalp engine is switched off, so it publishes no reading. Its gates and
+          the evidence for leaving it off are on the Scalp tab.
+        </Empty>
+      </>
+    );
   }
   return (
     <>
-      {rows.map((r) => {
+      {picker}
+      {[...rows]
+        // Ranked by the engine on screen. Sorting both lists by the swing
+        // score put whatever the scalp liked best wherever the swing engine
+        // happened to rank it.
+        .sort((a, b) => Math.abs(read(b, engine).score) - Math.abs(read(a, engine).score))
+        .map((r) => {
         const open = expanded === r.symbol;
+        const v = read(r, engine);
         // The engine names its own blocker; fall back to the first failing
         // gate so a row is never silent about why it is not trading.
         const blocker =
-          r.gates.find((g) => g.name === r.blockedBy && !g.passed) ??
-          r.gates.find((g) => !g.passed) ??
+          v.gates.find((g) => g.name === v.blockedBy && !g.passed) ??
+          v.gates.find((g) => !g.passed) ??
           null;
         return (
           <div key={r.symbol} className="rounded-xl bg-[var(--surface)] overflow-hidden">
@@ -1141,19 +1275,21 @@ function ScanTab({
                 <div className="flex items-center gap-2">
                   <TfStrip timeframes={r.timeframes} />
                   <span
-                    className={`tnum text-[13px] font-semibold w-11 text-right ${tone(r.score)}`}
+                    className={`tnum text-[13px] font-semibold w-11 text-right ${tone(v.score)}`}
                   >
-                    {r.score >= 0 ? "+" : ""}
-                    {r.score.toFixed(2)}
+                    {v.score >= 0 ? "+" : ""}
+                    {v.score.toFixed(2)}
                   </span>
                 </div>
               </div>
               <div className="mt-1 flex items-center gap-2 text-[9px] text-[var(--muted)]">
-                <span>align {pct(r.alignment, 0)}</span>
+                <span>align {pct(v.alignment, 0)}</span>
                 <span>·</span>
-                <span>conf {pct(r.confidence, 0)}</span>
+                <span>conf {pct(v.confidence, 0)}</span>
                 <span>·</span>
-                <span>{r.anchorTimeframe} {r.style}</span>
+                <span>
+                  {engine === "swing" ? `${r.anchorTimeframe} swing` : "15m/1h scalp"}
+                </span>
                 <span>·</span>
                 <span className={r.fundingRate > 0 ? "text-[var(--warn)]" : ""}>
                   fund {(r.fundingRate * 100).toFixed(4)}%
@@ -1169,19 +1305,7 @@ function ScanTab({
                 {r.hasPosition ? (
                   <span className="text-[var(--accent)]">position open — managing it</span>
                 ) : (
-                  <>
-                    <EngineLine label="swing" blocker={blocker} />
-                    {r.scalp && (
-                      <EngineLine
-                        label="scalp"
-                        blocker={
-                          r.scalp.gates.find((g) => g.name === r.scalp?.blockedBy && !g.passed) ??
-                          r.scalp.gates.find((g) => !g.passed) ??
-                          null
-                        }
-                      />
-                    )}
-                  </>
+                  <EngineLine label={engine} blocker={blocker} />
                 )}
               </div>
             </button>

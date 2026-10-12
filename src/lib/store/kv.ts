@@ -181,6 +181,8 @@ export function __setStore(next: KvStore | null): void {
 
 export const KEYS = {
   account: "algo:account",
+  /** Both engines' accounts. `account` remains for migrating older state. */
+  books: "algo:books",
   positions: "algo:positions",
   trades: "algo:trades",
   equity: "algo:equity",

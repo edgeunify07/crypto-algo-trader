@@ -18,12 +18,15 @@ import { fetchFuturesExchangeInfo, fetchMarkPrices } from "@/lib/futures/rest";
 import { KEYS, kv } from "@/lib/store/kv";
 import {
   STARTING_BALANCE,
+  booksFrom,
   drawdown,
   equity,
   newAccount,
   newId,
+  syncCombined,
   unrealisedTotal,
   type AccountState,
+  type Books,
   type EquityPoint,
   type ExitReason,
   type FuturesPosition,
@@ -127,6 +130,8 @@ export interface TickResult {
   closed: { symbol: string; reason: ExitReason; netPnl: number }[];
   fundingApplied: number;
   account: AccountState;
+  /** Each engine's own book, so the dashboard can show them apart. */
+  books: Books;
   positions: FuturesPosition[];
   equity: number;
   screener: ScreenerRowLite[];
@@ -217,13 +222,36 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
   const notes: string[] = [];
 
   // --- Load state ------------------------------------------------------
-  const [storedAccount, storedPositions, storedParams] = await Promise.all([
+  const [storedAccount, storedBooks, storedPositions, storedParams] = await Promise.all([
     store.get<AccountState>(KEYS.account),
+    store.get<Books>(KEYS.books),
     store.get<FuturesPosition[]>(KEYS.positions),
     store.get<{ version: string; params: StrategyParams }>(KEYS.params),
   ]);
 
-  const account: AccountState = storedAccount ?? newAccount(STARTING_BALANCE);
+  /**
+   * One book per engine, each with its own stake.
+   *
+   * `account` stays as the pair's combined view — the header figure, the
+   * halt check and the stored equity curve are about the whole deployment —
+   * but every balance movement goes to the book that caused it.
+   */
+  const books = booksFrom(storedBooks, storedAccount, STARTING_BALANCE);
+  const bookOf = (isScalp: boolean): AccountState => (isScalp ? books.scalp : books.swing);
+  /**
+   * The pair, as one account.
+   *
+   * Its money is a running sum of the two books; its history — when this
+   * deployment started, how many ticks it has run, the peak its equity curve
+   * is measured against — belongs to the pair and persists on its own.
+   */
+  const account: AccountState = syncCombined(
+    storedAccount ?? newAccount(STARTING_BALANCE * 2),
+    books,
+  );
+  /** Positions belonging to one engine, for valuing its book alone. */
+  const bookPositions = (isScalp: boolean) =>
+    positions.filter((x) => (x.scalp === true) === isScalp);
   let positions: FuturesPosition[] = storedPositions ?? [];
   const params = options.params ?? storedParams?.params ?? DEFAULT_PARAMS;
   const paramsVersion =
@@ -285,11 +313,13 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     const fundingCost = -fundingShare;
     const netPnl = grossPnl - exitFee - entryFeeShare - fundingCost;
 
-    // Margin comes back, plus whatever the position actually made.
-    account.balance += marginShare + grossPnl - exitFee - entryFeeShare;
-    account.realisedPnl += netPnl;
-    account.totalFees += exitFee + entryFeeShare;
-    account.totalFunding += fundingCost;
+    // Margin comes back, plus whatever the position actually made — to the
+    // book that put it up, so neither engine spends the other's winnings.
+    const book = bookOf(position.scalp === true);
+    book.balance += marginShare + grossPnl - exitFee - entryFeeShare;
+    book.realisedPnl += netPnl;
+    book.totalFees += exitFee + entryFeeShare;
+    book.totalFunding += fundingCost;
 
     const riskPerUnit = Math.abs(position.entryPrice - position.stopLoss);
     trades.push({
@@ -697,19 +727,32 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
   positions = positions.filter((p) => p.quantity > 1e-12);
 
   // --- 5. Account health ----------------------------------------------
+  /**
+   * Each book halts on its own drawdown.
+   *
+   * With separate stakes a shared halt would be the wrong instrument: one
+   * engine having a bad month would stop the other from trading its own
+   * money, and the whole point of the split is that their results are
+   * independent.
+   */
+  for (const isScalp of [false, true]) {
+    const book = bookOf(isScalp);
+    const bookEquity = equity(book, bookPositions(isScalp), markBySymbol);
+    book.peakEquity = Math.max(book.peakEquity, bookEquity);
+    const bookDd = drawdown(book, bookEquity);
+    if (bookDd >= limits.maxDrawdown) {
+      book.haltedReason = `max drawdown ${(bookDd * 100).toFixed(1)}% reached`;
+    } else if (book.haltedReason && bookDd < limits.maxDrawdown * 0.8) {
+      // Resume only after recovering clearly, not on the first tick back under.
+      book.haltedReason = null;
+    }
+  }
+  syncCombined(account, books);
   const currentEquity = equity(account, positions, markBySymbol);
   account.peakEquity = Math.max(account.peakEquity, currentEquity);
-  const dd = drawdown(account, currentEquity);
-
-  if (dd >= limits.maxDrawdown) {
-    account.haltedReason = `max drawdown ${(dd * 100).toFixed(1)}% reached`;
-  } else if (account.haltedReason && dd < limits.maxDrawdown * 0.8) {
-    // Resume only after recovering clearly, not on the first tick back under.
-    account.haltedReason = null;
-  }
 
   // --- 6. New entries --------------------------------------------------
-  if (!options.manageOnly && !account.haltedReason) {
+  if (!options.manageOnly && !(books.swing.haltedReason && books.scalp.haltedReason)) {
     const info = await fetchFuturesExchangeInfo().catch(() => new Map());
 
     /**
@@ -791,6 +834,13 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
 
       if (!swingWants && !scalpWants) continue;
       const isScalp = !swingWants && scalpWants;
+      // A book in drawdown stops trading; the other carries on with its own
+      // money, which is the point of giving them separate stakes.
+      const halted = bookOf(isScalp).haltedReason;
+      if (halted) {
+        reject(row.symbol, `${isScalp ? "scalp" : "swing"} book trading`, "not halted", halted);
+        continue;
+      }
       const signal = (isScalp ? scalpBlend : blended) as NonNullable<typeof blended>;
       const anchor = signal.anchor;
       if (!anchor) continue;
@@ -863,16 +913,27 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
        * by different rules and the backtest did not describe what production
        * would do.
        */
-      const byRisk = (currentEquity * limits.riskPerTrade) / stopDistance;
-      const byCapital = (currentEquity * limits.capitalPerTrade * limits.leverage) / mark;
+      /**
+       * Sized against this engine's own book, never the pair's.
+       *
+       * Both percentages are shares of equity, so taking them from the
+       * combined account would size every scalp against the swing book's
+       * money as well — two engines each committing 20% "of capital" would
+       * between them commit 40% of a pot that is only one of theirs. Each
+       * engine funds its own trades out of its own stake.
+       */
+      const book = bookOf(isScalp);
+      const bookEquity = equity(book, bookPositions(isScalp), markBySymbol);
+      const byRisk = (bookEquity * limits.riskPerTrade) / stopDistance;
+      const byCapital = (bookEquity * limits.capitalPerTrade * limits.leverage) / mark;
       let quantity = Math.min(byRisk, byCapital);
 
       // Respect the notional cap and the margin actually available.
-      const maxNotional = currentEquity * limits.maxPositionFraction;
+      const maxNotional = bookEquity * limits.maxPositionFraction;
       if (quantity * mark > maxNotional) quantity = maxNotional / mark;
 
       // Margin is deducted from `balance` at open, so balance *is* free collateral.
-      const free = account.balance;
+      const free = book.balance;
       const neededMargin = initialMargin(quantity * mark, limits.leverage);
       if (neededMargin > free * 0.95) {
         quantity = (free * 0.95 * limits.leverage) / mark;
@@ -898,18 +959,18 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
 
       const margin = initialMargin(notional, limits.leverage);
       const entryFee = commission(notional, "taker");
-      if (margin + entryFee > account.balance) {
+      if (margin + entryFee > book.balance) {
         reject(
           row.symbol,
           "margin available",
           `${(margin + entryFee).toFixed(2)} USDT`,
-          `${account.balance.toFixed(2)} USDT free`,
+          `${book.balance.toFixed(2)} USDT free in the ${isScalp ? "scalp" : "swing"} book`,
         );
         continue;
       }
 
-      account.balance -= margin + entryFee;
-      account.totalFees += entryFee;
+      book.balance -= margin + entryFee;
+      book.totalFees += entryFee;
 
       const takeProfits = isScalp
         ? [
@@ -984,13 +1045,22 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       positions.push(position);
       opened.push({ symbol: row.symbol, side, reason: position.reasons[0] ?? "" });
     }
-  } else if (account.haltedReason) {
-    notes.push(`entries halted: ${account.haltedReason}`);
+  } else if (books.swing.haltedReason && books.scalp.haltedReason) {
+    notes.push(
+      `entries halted — swing: ${books.swing.haltedReason}; ` +
+        `scalp: ${books.scalp.haltedReason}`,
+    );
   }
 
   // --- 7. Persist -------------------------------------------------------
+  syncCombined(account, books);
   const finalEquity = equity(account, positions, markBySymbol);
   account.peakEquity = Math.max(account.peakEquity, finalEquity);
+  for (const book of [books.swing, books.scalp]) {
+    book.tickCount += 1;
+    book.lastTickAt = now;
+    book.updatedAt = now;
+  }
   account.tickCount += 1;
   account.lastTickAt = now;
   account.updatedAt = now;
@@ -1005,6 +1075,7 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
 
   await Promise.all([
     store.set(KEYS.account, account),
+    store.set(KEYS.books, books),
     store.set(KEYS.positions, positions),
     store.set(KEYS.screener, screener, 600),
     store.push(KEYS.equity, equityPoint, 2000),
@@ -1020,6 +1091,7 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     closed,
     fundingApplied,
     account,
+    books,
     positions,
     equity: finalEquity,
     screener: screener.sort(
