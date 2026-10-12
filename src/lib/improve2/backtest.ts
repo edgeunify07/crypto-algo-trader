@@ -1,4 +1,5 @@
 import { analyseTimeframe } from "@/lib/algo/screener/analyse";
+import { riskLimits } from "@/lib/engine2/limits";
 import type { StrategyParams } from "@/lib/algo/strategy/params";
 import {
   TIMEFRAME_MS,
@@ -263,16 +264,29 @@ export function runFuturesBacktest(
     execution?: StrategyParams["execution"];
   } = {},
 ): BacktestResult {
+  /**
+   * Unset options fall back to the live engine's limits, not to constants.
+   *
+   * Three of these used to default to a hardcoded number or an environment
+   * variable, so a backtest silently simulated a 2% risk cap and a 150%
+   * notional ceiling whatever the parameters said. Sweeping
+   * `risk.riskPerTrade` across 1%, 2.5% and 5% therefore produced three
+   * byte-identical results: the knob was not connected to anything.
+   *
+   * `riskLimits` is the one place those limits are decided, so asking it
+   * here is what keeps the simulation and the account in step.
+   */
+  const live = riskLimits(params);
   const {
     stepTimeframe = "1h",
     startingBalance = 100,
-    leverage = 3,
-    riskPerTrade = 0.02,
-    capitalPerTrade = params.risk.capitalPerTrade,
-    maxOpenPositions = Number(process.env.MAX_OPEN_POSITIONS ?? "3"),
-    maxDrawdownHalt = Number(process.env.MAX_DRAWDOWN ?? "0.3"),
+    leverage = live.leverage,
+    riskPerTrade = live.riskPerTrade,
+    capitalPerTrade = live.capitalPerTrade,
+    maxOpenPositions = live.maxOpenPositions,
+    maxDrawdownHalt = live.maxDrawdown,
     execution = params.execution,
-    maxPositionFraction = Number(process.env.MAX_POSITION_FRACTION ?? "1.5"),
+    maxPositionFraction = live.maxPositionFraction,
     windowBars = 260,
   } = options;
 

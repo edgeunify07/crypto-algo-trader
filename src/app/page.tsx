@@ -173,6 +173,29 @@ function fmtPrice(n: number): string {
   return n.toFixed(6);
 }
 
+/**
+ * Chart intervals offered on each engine's tab.
+ *
+ * An engine reading 1m/5m/15m has nothing to say about a daily candle, and a
+ * swing engine reading 1h/4h/1d has nothing to say about a one-minute one.
+ * Offering the whole range on both invites reading a chart on a timeframe
+ * the engine never looked at and concluding it missed something.
+ *
+ * This narrows the engine chart, which this page draws. The TradingView tab
+ * is an iframe with its own picker inside it, so its range cannot be
+ * restricted from out here — only the interval it opens on.
+ */
+const CHART_RANGE: Record<"swing" | "scalp", string[]> = {
+  scalp: ["1m", "3m", "5m", "15m", "30m", "1h"],
+  swing: ["15m", "1h", "4h", "1d"],
+};
+
+/**
+ * The standalone Chart tab belongs to no engine, so it narrows nothing.
+ * Looking at a market on whatever interval you like is the point of it.
+ */
+const CHART_RANGE_ALL = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"];
+
 export default function Home() {
   const [state, setState] = useState<State | null>(null);
   const [rows, setRows] = useState<ScreenerRow[]>([]);
@@ -326,6 +349,16 @@ export default function Home() {
   const symbol = picked ?? rows[0]?.symbol ?? "BTCUSDT";
   const [chartTf, setChartTf] = useState("1h");
   /**
+   * The interval the charts actually use.
+   *
+   * Derived rather than corrected in an effect: the scalp tab offers no 4h
+   * button, so a 4h selection carried over from the swing tab would leave
+   * both charts on an interval the tab cannot show and no way back to it.
+   */
+  const chartRange =
+    tab === "scalp" || tab === "swing" ? CHART_RANGE[tab] : CHART_RANGE_ALL;
+  const activeTf = chartRange.includes(chartTf) ? chartTf : (chartRange[0] as string);
+  /**
    * Which chart to show. TradingView by default because it streams from its
    * own domain and therefore moves wherever the page loads; the engine's own
    * chart needs this browser to reach Binance's websocket, which is blocked
@@ -340,7 +373,7 @@ export default function Home() {
   // Stable across polls that return the same symbols, so the effect below
   // does not rewrite the ref on every refresh.
   const watchKey = watchlist.join(",");
-  const stream = useBinanceStream(symbol, chartTf, watchlist);
+  const stream = useBinanceStream(symbol, activeTf, watchlist);
   const polled = useBook(symbol);
 
   /**
@@ -575,7 +608,8 @@ export default function Home() {
               {selectedRow && <SignalHeadline row={selectedRow} />}
               <ChartSwitch
                 symbol={symbol}
-                timeframe={chartTf}
+                timeframe={activeTf}
+                timeframes={chartRange}
                 onTimeframe={setChartTf}
                 stream={stream}
                 streaming={streaming}
@@ -630,7 +664,8 @@ export default function Home() {
             </div>
             <ChartSwitch
               symbol={symbol}
-              timeframe={chartTf}
+              timeframe={activeTf}
+              timeframes={chartRange}
               onTimeframe={setChartTf}
               stream={stream}
               streaming={streaming}
@@ -677,6 +712,7 @@ function ChartSwitch({
   streaming,
   source,
   onSource,
+  timeframes,
 }: {
   symbol: string;
   timeframe: string;
@@ -685,6 +721,8 @@ function ChartSwitch({
   streaming: boolean;
   source: "tradingview" | "engine";
   onSource: (s: "tradingview" | "engine") => void;
+  /** Intervals the engine reading this chart actually looks at. */
+  timeframes: string[];
 }) {
   return (
     <div className="space-y-1.5">
@@ -709,7 +747,7 @@ function ChartSwitch({
         ))}
         <span className="ml-auto text-[9px] text-[var(--muted)]">
           {source === "tradingview"
-            ? "TradingView's feed and indicators"
+            ? `TradingView's feed · opens on ${timeframe}`
             : streaming
               ? "the strategy's own series, live"
               : "the strategy's own series, server-polled"}
@@ -719,11 +757,16 @@ function ChartSwitch({
         <TradingViewChart symbol={symbol} timeframe={timeframe} />
       ) : (
         <Chart
+          /* Remount when the offered intervals change: the selected one is
+             the chart's own state, so without this, switching to the scalp
+             tab leaves it sitting on 4h with no button to match. */
+          key={timeframes.join()}
           symbol={symbol}
           liveKline={stream.kline}
           mark={stream.mark}
           onTimeframe={onTimeframe}
           streaming={streaming}
+          timeframes={timeframes}
         />
       )}
     </div>

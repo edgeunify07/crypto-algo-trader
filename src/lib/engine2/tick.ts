@@ -17,7 +17,6 @@ import {
 import { fetchFuturesExchangeInfo, fetchMarkPrices } from "@/lib/futures/rest";
 import { KEYS, kv } from "@/lib/store/kv";
 import {
-  DEFAULT_LEVERAGE,
   STARTING_BALANCE,
   drawdown,
   equity,
@@ -62,25 +61,8 @@ const STYLE_BY_TIMEFRAME: Partial<Record<Timeframe, TradeStyle>> = {
   "1d": "swing",
 };
 
-export interface TickRiskLimits {
-  maxOpenPositions: number;
-  maxDrawdown: number;
-  /** Fraction of equity risked per trade. */
-  riskPerTrade: number;
-  /** Cap on one position's notional as a fraction of equity. */
-  maxPositionFraction: number;
-  leverage: number;
-}
-
-export function riskLimits(): TickRiskLimits {
-  return {
-    maxOpenPositions: Number(process.env.MAX_OPEN_POSITIONS ?? "3"),
-    maxDrawdown: Number(process.env.MAX_DRAWDOWN ?? "0.3"),
-    riskPerTrade: Number(process.env.RISK_PER_TRADE ?? "0.02"),
-    maxPositionFraction: Number(process.env.MAX_POSITION_FRACTION ?? "1.5"),
-    leverage: DEFAULT_LEVERAGE,
-  };
-}
+import { riskLimits } from "./limits";
+export { riskLimits, type TickRiskLimits } from "./limits";
 
 export interface ScreenerRowLite {
   symbol: string;
@@ -233,7 +215,6 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
   const startedAt = Date.now();
   const store = kv();
   const notes: string[] = [];
-  const limits = riskLimits();
 
   // --- Load state ------------------------------------------------------
   const [storedAccount, storedPositions, storedParams] = await Promise.all([
@@ -247,6 +228,8 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
   const params = options.params ?? storedParams?.params ?? DEFAULT_PARAMS;
   const paramsVersion =
     options.paramsVersion ?? storedParams?.version ?? "default-v1";
+  // After the parameters load, because that is where the limits live.
+  const limits = riskLimits(params);
 
   // --- Market data -----------------------------------------------------
   const universe = await resolveUniverse();
@@ -869,8 +852,20 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         continue;
       }
 
-      const riskCapital = currentEquity * limits.riskPerTrade;
-      let quantity = riskCapital / stopDistance;
+      /**
+       * Size is the smaller of two answers to different questions.
+       *
+       * `capitalPerTrade` asks how much of the account this position should
+       * commit as margin; `riskPerTrade` asks how much may be lost if the
+       * stop is hit. Only the second was applied here, so a tight stop bought
+       * an enormous position — the backtester has always taken the smaller of
+       * the two, which meant the simulation and the live account were sizing
+       * by different rules and the backtest did not describe what production
+       * would do.
+       */
+      const byRisk = (currentEquity * limits.riskPerTrade) / stopDistance;
+      const byCapital = (currentEquity * limits.capitalPerTrade * limits.leverage) / mark;
+      let quantity = Math.min(byRisk, byCapital);
 
       // Respect the notional cap and the margin actually available.
       const maxNotional = currentEquity * limits.maxPositionFraction;

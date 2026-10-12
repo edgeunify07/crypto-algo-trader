@@ -350,7 +350,20 @@ describe("runFuturesBacktest scalp rule", () => {
       {
         ...TRADES_READILY,
         entry: { ...TRADES_READILY.entry, timeframes: ["4h", "1d"] },
-        scalp: { ...DEFAULT_PARAMS.scalp, enabled: true, timeframes: ["15m"], maxOpen: 3 },
+        // Gates loose on purpose: this is about which timeframes each engine
+        // reads, not about how the scalp happens to be tuned. Inheriting the
+        // shipped gates tied it to them, and it duly went silent the day they
+        // were tightened — passing every assertion except the one checking a
+        // trade had happened at all.
+        scalp: {
+          ...DEFAULT_PARAMS.scalp,
+          enabled: true,
+          timeframes: ["15m"],
+          maxOpen: 3,
+          minScore: 0.15,
+          minConfidence: 0.1,
+          minAlignment: 0.2,
+        },
       },
       { stepTimeframe: "15m", startingBalance: 100 },
     );
