@@ -1,10 +1,8 @@
 # Drives the trading loop when nobody has the app open.
 #
-# Vercel Cron on the Hobby plan fires once per day, which is fine for the
-# daily strategy-improvement round but far too slow to trade on. This runs
-# every 5 minutes and calls the tick endpoint, which advances the loop by one
-# step: refresh candles, settle funding, manage stops and targets, and open
-# new positions when a setup qualifies.
+# The endpoint needs no credentials, so the real answer is an external
+# scheduler — see "The external pinger" below, and set one up. This workflow
+# is what runs until you do, and it is a stopgap, not a replacement.
 #
 # Setup: none, if DEFAULT_APP_URL below points at your deployment. Both
 # repository secrets are optional overrides:
@@ -15,23 +13,59 @@
 #                so every tick would be swallowed by a redirect.
 #   CRON_SECRET  the value set in Vercel. Without it the tick endpoint still
 #                accepts this workflow, but as an anonymous caller subject to
-#                its rate limit — fine at five-minute intervals. With it, the
-#                limit does not apply.
+#                its one-per-minute limit, which is what TICK_SECONDS respects.
+#                With it, the limit does not apply and the interval can drop.
 #
+# ---------------------------------------------------------------------------
+# Why this run is hours long
+#
+# GitHub runs scheduled workflows on a best-effort basis, and "best effort" is
+# weaker than it sounds: measured on this repository, a */5 schedule fired
+# ONCE in nine hours instead of about a hundred times. Runs are silently
+# dropped under load rather than queued.
+#
+# A run that ticked four times and exited therefore covered about four minutes
+# out of every nine hours. That is not a trading loop. So each run now holds
+# the job open and ticks on an interval for most of GitHub's six-hour limit:
+# the schedule only has to survive once per window instead of once per tick.
+#
+# The concurrency group does the rest. A schedule that fires while a run is
+# already going is queued rather than dropped — GitHub keeps the newest
+# pending run and discards older pending ones — so it starts the moment the
+# current run ends, and the chain continues without a gap.
+#
+# This matters beyond trade entries: the engine only checks stops when it
+# ticks, so a long gap means a stop can be overshot well past its price before
+# anything notices. Gaps here cost real money, which is the whole reason for
+# spending six hours of a runner on it.
+#
+# Minutes are free and unlimited on a public repository, so this costs
+# nothing. Be aware that it is an unusual thing to ask of Actions, which is
+# meant for building and testing: a keep-alive loop is within what a project
+# may do for its own deployment, but it is not what the runners are for.
+#
+# ---------------------------------------------------------------------------
+# The external pinger
+#
+# Point a real scheduler at the tick endpoint and this workflow becomes the
+# backup rather than the mechanism. It needs no credentials:
+#
+#   POST https://crypto-algo-trader.vercel.app/api/v2/tick
+#
+# On cron-job.org (free, no card): Sign up → Create cronjob → paste the URL →
+# set the schedule to "Every 1 minute" → Create. Nothing on the Advanced tab
+# needs changing: the route answers GET as well as POST, and takes no body,
+# no headers and no auth.
+#
+# Once that scheduler is confirmed green, DISABLE this workflow — Actions tab
+# → tick → ⋯ → Disable workflow. Holding a runner open for six hours as a
+# redundant backup to something that already works is not what Actions is
+# for, and a tick arriving from both is wasted work either way.
+#
+# ---------------------------------------------------------------------------
 # Notes:
-#   - GitHub runs scheduled workflows on a best-effort basis, and "best
-#     effort" is weaker than it sounds: measured on this repository, a */5
-#     schedule fired ONCE in nine hours instead of about a hundred times.
-#     Runs are silently dropped under load rather than queued. So each run
-#     that does fire ticks several times across its budget instead of once —
-#     it does not fix the gaps, but it makes a surviving run worth more.
-#
-#     This matters beyond trade entries: the engine only checks stops when it
-#     ticks, so a long gap means a stop can be overshot well past its price
-#     before anything notices. If the account is ever to be taken seriously,
-#     point a real scheduler at /api/v2/tick — it needs no credentials.
-#   - The tick is idempotent and holds a lock, so a late or doubled run is
-#     harmless.
+#   - The tick is idempotent and holds a lock, so a late, doubled or
+#     overlapping run is harmless.
 #   - GitHub disables schedules after 60 days with no repository activity.
 #     Push a commit, or press "Run workflow", to re-arm it.
 
@@ -41,13 +75,30 @@ on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long this run should keep ticking"
+        required: false
+        default: "345"
+      interval:
+        description: "Seconds between ticks"
+        required: false
+        default: "65"
 
 env:
   # The deployment this repository drives. A public URL, so it belongs in the
   # file rather than in a secret nobody can be sure got set.
   DEFAULT_APP_URL: https://crypto-algo-trader.vercel.app
+  # 5h45m of ticking. GitHub kills a job at six hours, and a killed job never
+  # reaches its summary step, so the loop stops itself with room to spare.
+  RUN_MINUTES: "345"
+  # Just past the endpoint's one-per-minute allowance for anonymous callers.
+  # Below it the extra ticks are refused, not served.
+  TICK_SECONDS: "65"
 
-# A slow tick must never have a second run pile up behind it.
+# A slow tick must never have a second run pile up behind it. `cancel-in-
+# progress: false` is also what banks a scheduled fire that lands mid-run
+# instead of dropping it.
 concurrency:
   group: trading-tick
   cancel-in-progress: false
@@ -55,14 +106,15 @@ concurrency:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    # Four ticks, three 65s waits, and curl allowed 60s each: 7m15s in the
-    # worst case, against about 3m30s typically.
-    timeout-minutes: 9
+    # The backstop, a few minutes past where the loop stops itself.
+    timeout-minutes: 350
     steps:
       - name: Advance the trading loop
         env:
           APP_URL: ${{ secrets.APP_URL || env.DEFAULT_APP_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          RUN_MINUTES: ${{ inputs.minutes || env.RUN_MINUTES }}
+          TICK_SECONDS: ${{ inputs.interval || env.TICK_SECONDS }}
         run: |
           set -euo pipefail
 
@@ -87,40 +139,57 @@ jobs:
             auth=(-H "Authorization: Bearer ${CRON_SECRET}")
           fi
 
-          # Several ticks per run, spaced just past the endpoint's
-          # one-per-minute limit for anonymous callers. The job's own
-          # timeout-minutes is the backstop.
+          # Both are typed into a form on a manual run, so neither can be
+          # trusted to be a number. Unvalidated, "5.5" ends the script on an
+          # arithmetic syntax error before a single tick.
+          case "$RUN_MINUTES" in (*[!0-9]*|"") echo "::error::minutes must be a whole number, got '${RUN_MINUTES}'"; exit 1;; esac
+          case "$TICK_SECONDS" in (*[!0-9]*|"") echo "::error::interval must be a whole number, got '${TICK_SECONDS}'"; exit 1;; esac
+          [ "$TICK_SECONDS" -gt 0 ] || { echo "::error::interval must be at least 1 second"; exit 1; }
+
+          deadline=$(( $(date +%s) + RUN_MINUTES * 60 ))
+          ok=0
+          failed=0
           response=""
-          for attempt in 1 2 3 4; do
-            # `[ ... ] && sleep` would return non-zero on the first pass and
-            # `set -e` would end the script there, before a single tick.
-            if [ "$attempt" -gt 1 ]; then sleep 65; fi
+          last_good=""
+
+          # Tick first, then check the clock. Testing the deadline up front
+          # makes a short run — or a run whose minutes came in as 0 — do
+          # nothing at all and then fail for having done nothing.
+          while :; do
             # --fail-with-body so a non-2xx still prints why it failed.
-            response=$(curl --silent --show-error --fail-with-body \
+            if response=$(curl --silent --show-error --fail-with-body \
               --max-time 60 --retry 2 --retry-delay 5 \
-              -X POST "${APP_URL}/api/v2/tick" "${auth[@]}") || {
-                echo "::warning::tick $attempt failed"
-                continue
-              }
-            echo "tick $attempt: $response"
+              -X POST "${APP_URL}/api/v2/tick" "${auth[@]}"); then
+              ok=$(( ok + 1 ))
+              last_good="$response"
+              # One line each, so a six-hour run stays readable in the log.
+              echo "$(date -u +%H:%M:%S) tick $ok — equity $(jq -r '.equity // 0 | . * 100 | round / 100' <<< "$response"), positions $(jq -r '.positions // 0' <<< "$response"), opened $(jq -r '.opened | length' <<< "$response"), closed $(jq -r '.closed | length' <<< "$response")"
+            else
+              failed=$(( failed + 1 ))
+              echo "::warning::tick failed ($failed so far)"
+            fi
+            # Don't sleep past the deadline just to exit immediately after.
+            [ "$(( $(date +%s) + TICK_SECONDS ))" -lt "$deadline" ] || break
+            sleep "$TICK_SECONDS"
           done
 
-          if [ -z "$response" ]; then
-            echo "::error::every tick in this run failed"
+          if [ "$ok" -eq 0 ]; then
+            echo "::error::every tick in this run failed ($failed attempts)"
             exit 1
           fi
 
           # Surface the outcome in the run summary. jq is preinstalled on
           # ubuntu-latest; the // fallbacks keep this working if a field is absent.
           {
-            if [ "$(jq -r '.skipped // false' <<< "$response")" = "true" ]; then
-              echo "Skipped: $(jq -r '.reason // "unknown"' <<< "$response")"
+            echo "**$ok ticks**, $failed failed, over ${RUN_MINUTES}m at ${TICK_SECONDS}s intervals."
+            echo ""
+            if [ "$(jq -r '.skipped // false' <<< "$last_good")" = "true" ]; then
+              echo "Last tick skipped: $(jq -r '.reason // "unknown"' <<< "$last_good")"
             else
-              echo "- equity: \$$(jq -r '.equity // 0 | . * 10000 | round / 10000' <<< "$response")"
-              echo "- positions: $(jq -r '.positions // 0' <<< "$response")"
-              echo "- opened: $(jq -r '.opened | length' <<< "$response"), closed: $(jq -r '.closed | length' <<< "$response")"
-              echo "- duration: $(jq -r '.durationMs // 0' <<< "$response")ms"
-              if [ "$(jq -r '.durable // false' <<< "$response")" != "true" ]; then
+              echo "- equity: \$$(jq -r '.equity // 0 | . * 10000 | round / 10000' <<< "$last_good")"
+              echo "- positions: $(jq -r '.positions // 0' <<< "$last_good")"
+              echo "- duration: $(jq -r '.durationMs // 0' <<< "$last_good")ms"
+              if [ "$(jq -r '.durable // false' <<< "$last_good")" != "true" ]; then
                 echo "> **Warning:** storage is not durable — set the Upstash env vars in Vercel."
               fi
             fi
