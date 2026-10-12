@@ -47,7 +47,7 @@ export async function GET() {
   ]);
 
   const books = booksFrom(storedBooks, account, STARTING_BALANCE);
-  const acct = syncCombined(account ?? newAccount(STARTING_BALANCE * 2), books);
+  const acct = syncCombined(account ? { ...account } : newAccount(STARTING_BALANCE * 2), books);
   const open = positions ?? [];
 
   const marks: Record<string, number> = {};
