@@ -91,7 +91,14 @@ export interface ChartData {
   }[];
 }
 
-const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"];
+/**
+ * Every timeframe this chart can draw, when the caller does not narrow it.
+ *
+ * The scalp tab passes a shorter list: an engine reading 1m/5m/15m has
+ * nothing to say about a daily candle, and offering one invites reading the
+ * chart on a timeframe the engine never looked at.
+ */
+const TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d"];
 
 /**
  * The server poll now only refreshes closed history and the analysis — the
@@ -125,6 +132,7 @@ export default function Chart({
   mark,
   onTimeframe,
   streaming,
+  timeframes = TIMEFRAMES,
 }: {
   symbol: string;
   /** Latest bar from the websocket; redraws between server refreshes. */
@@ -138,8 +146,10 @@ export default function Chart({
   mark?: LiveMark | null;
   onTimeframe?: (tf: string) => void;
   streaming?: boolean;
+  /** Which intervals to offer, fastest first. The first one is the default. */
+  timeframes?: string[];
 }) {
-  const [timeframe, setTimeframe] = useState("1h");
+  const [timeframe, setTimeframe] = useState(timeframes[0] ?? "1h");
   const [data, setData] = useState<ChartData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -298,7 +308,7 @@ export default function Chart({
           className={`h-1.5 w-1.5 shrink-0 rounded-full ${streaming ? "live-dot bg-[var(--up)]" : "bg-[var(--muted)]"}`}
           title={streaming ? "streaming from Binance" : "polling"}
         />
-        {TIMEFRAMES.map((tf) => (
+        {timeframes.map((tf) => (
           <button
             key={tf}
             onClick={() => {
