@@ -319,6 +319,19 @@ for (let i = 0; RESUME ? false : i < TRIALS; i++) {
       `  ...${i}/${TRIALS} survivors=${stage1.length} ` +
         `(${(per / 1000).toFixed(1)}s/trial, ~${left.toFixed(0)}m left)`,
     );
+    /**
+     * Checkpoint as it goes, not only when stage 1 finishes.
+     *
+     * This container restarts often enough that a run which only saves at
+     * the end is a run that mostly saves nothing: one was killed at trial
+     * 100 of 400 with no checkpoint to resume from, and ninety minutes of
+     * search went with it. Written every 25 trials, a restart costs minutes
+     * instead of the whole stage, and RESUME=1 picks up whatever survived.
+     */
+    fs.writeFileSync(
+      `${OUT}/finalists.json`,
+      JSON.stringify({ at: Date.now(), trials: i, finalists: stage1.slice(0, KEEP) }),
+    );
   }
 
   const p = sample(best);
