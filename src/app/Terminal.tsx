@@ -296,6 +296,24 @@ export interface StrategyInfo {
   indicators: Record<string, number | boolean>;
   entry: Record<string, number | boolean>;
   exit: Record<string, unknown>;
+  /**
+   * The scalp engine's own configuration.
+   *
+   * Carried to the client so its tab can say what it is doing rather than
+   * showing an empty list. An engine that is switched off and an engine that
+   * is on but has found nothing look identical from the positions alone, and
+   * they are not the same thing at all.
+   */
+  scalp?: {
+    enabled: boolean;
+    timeframes: string[];
+    minScore: number;
+    minConfidence: number;
+    minAlignment: number;
+    maxOpen: number;
+    targetPct: number;
+    maxHoldBars: number;
+  };
 }
 
 /**

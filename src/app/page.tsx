@@ -141,6 +141,7 @@ interface State {
       indicators: Record<string, number | boolean>;
       entry: Record<string, number | boolean>;
       exit: Record<string, unknown>;
+      scalp?: StrategyInfo["scalp"];
     };
   };
 }
@@ -176,7 +177,9 @@ export default function Home() {
   const [state, setState] = useState<State | null>(null);
   const [rows, setRows] = useState<ScreenerRow[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
-  const [tab, setTab] = useState<"live" | "scan" | "chart" | "history">("live");
+  const [tab, setTab] = useState<"swing" | "scalp" | "scan" | "chart" | "history">(
+    "swing",
+  );
   const [expanded, setExpanded] = useState<string | null>(null);
   const [ticking, setTicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -395,6 +398,17 @@ export default function Home() {
     blockedBy: r.blockedBy,
   }));
 
+  /**
+   * The two books, kept apart from here down.
+   *
+   * Each engine gets its own tab rather than a section inside a shared one.
+   * A swing position runs for days off a 1h/4h/1d read and a scalp is out
+   * within hours off minute bars; side by side in one list, a bad day for one
+   * reads as a bad day for the strategy, and neither book can be judged.
+   */
+  const swingPositions = (state?.positions ?? []).filter((x) => !x.scalp);
+  const scalpPositions = (state?.positions ?? []).filter((x) => x.scalp);
+
   const selectedRow = rows.find((r) => r.symbol === symbol) ?? null;
   const strategy: StrategyInfo | null = state?.params.detail
     ? {
@@ -404,6 +418,7 @@ export default function Home() {
         indicators: state.params.detail.indicators,
         entry: state.params.detail.entry,
         exit: state.params.detail.exit,
+        scalp: state.params.detail.scalp,
       }
     : null;
 
@@ -488,7 +503,7 @@ export default function Home() {
 
       {/* ---- Tabs ---- */}
       <nav className="flex gap-1 px-4 py-3">
-        {(["live", "scan", "chart", "history"] as const).map((t) => (
+        {(["swing", "scalp", "scan", "chart", "history"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -498,19 +513,21 @@ export default function Home() {
                 : "text-[var(--muted)]"
             }`}
           >
-            {t === "live"
-              ? `Positions${state?.positions.length ? ` ${state.positions.length}` : ""}`
-              : t === "scan"
-                ? "Signals"
-                : t === "chart"
-                  ? "Chart"
-                  : `Trades${state?.stats.trades ? ` ${state.stats.trades}` : ""}`}
+            {t === "swing"
+              ? `Swing${swingPositions.length ? ` ${swingPositions.length}` : ""}`
+              : t === "scalp"
+                ? `Scalp${scalpPositions.length ? ` ${scalpPositions.length}` : ""}`
+                : t === "scan"
+                  ? "Signals"
+                  : t === "chart"
+                    ? "Chart"
+                    : `Trades${state?.stats.trades ? ` ${state.stats.trades}` : ""}`}
           </button>
         ))}
       </nav>
 
       <div className="px-3 space-y-2 2xl:px-6">
-        {tab === "live" && (
+        {(tab === "swing" || tab === "scalp") && (
           /* One column on a phone, a terminal on anything wider. The market
              rail and the book are the panels that need width, so they are the
              ones that appear as the viewport grows. */
@@ -566,7 +583,11 @@ export default function Home() {
                 onSource={setChartSource}
               />
               <BacktestPanel days={30} />
-              <LiveTab positions={state?.positions ?? []} />
+              <EngineTab
+                engine={tab}
+                positions={tab === "swing" ? swingPositions : scalpPositions}
+                scalp={strategy?.scalp}
+              />
             </div>
 
             <div className="hidden lg:block space-y-2 lg:sticky lg:top-[150px] self-start">
@@ -883,49 +904,65 @@ function Empty({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * Open positions, with the two engines kept apart.
+ * One engine's book, with enough context to read it.
  *
- * They are different trades with different lifetimes — a swing position runs
- * for days on a 1h/4h/1d read, a scalp is out within a day on 15m/1h — and
- * mixed into one list neither book can be judged. Each section carries its
- * own count and unrealised total so it is obvious at a glance which engine
- * is making or losing the money.
+ * Positions alone cannot distinguish an engine that is switched off from one
+ * that is running and has found nothing — both show an empty list — so when
+ * the scalp engine is disabled this says so, and says what turning it on
+ * would mean. The alternative is a tab that looks broken.
  */
-function LiveTab({ positions }: { positions: Position[] }) {
-  if (positions.length === 0) {
-    return <Empty>No open positions — both engines are waiting for a qualified setup.</Empty>;
-  }
-  const swing = positions.filter((p) => !p.scalp);
-  const scalp = positions.filter((p) => p.scalp);
+function EngineTab({
+  engine,
+  positions,
+  scalp,
+}: {
+  engine: "swing" | "scalp";
+  positions: Position[];
+  scalp: StrategyInfo["scalp"];
+}) {
+  const unrealised = positions.reduce((a, r) => a + r.unrealised, 0);
+  const off = engine === "scalp" && scalp?.enabled === false;
+  const tfs =
+    engine === "scalp" ? (scalp?.timeframes ?? []).join(" · ") : "1h · 4h · 1d";
+
   return (
-    <div className="space-y-3">
-      {[
-        { title: "Swing", rows: swing, note: "1h · 4h · 1d · runs to its targets" },
-        { title: "Scalp", rows: scalp, note: "15m · 1h · fixed target, short clock" },
-      ].map(({ title, rows, note }) => (
-        <section key={title} className="space-y-2">
-          <div className="flex items-baseline justify-between px-0.5">
-            <span className="text-[11px] font-medium">
-              {title}
-              <span className="ml-1.5 text-[var(--muted)]">{rows.length}</span>
+    <div className="space-y-2">
+      <div className="flex items-baseline justify-between px-0.5">
+        <span className="text-[11px] font-medium">
+          {engine === "swing" ? "Swing" : "Scalp"}
+          <span className="ml-1.5 text-[var(--muted)]">{positions.length}</span>
+          {tfs && <span className="ml-2 text-[9px] text-[var(--muted)]">{tfs}</span>}
+        </span>
+        {positions.length > 0 && (
+          <span className={`tnum text-[11px] ${tone(unrealised)}`}>{signed(unrealised)}</span>
+        )}
+      </div>
+
+      {off ? (
+        <div className="rounded-xl bg-[var(--surface)] px-3 py-3 text-[11px] leading-relaxed text-[var(--muted)]">
+          <span className="text-[var(--text)]">This engine is switched off.</span> It is
+          built and tested, but no configuration measured so far beats leaving it
+          off — every setting that traded often enough to matter lost money on the
+          window it was tuned on. Turning it on is one flag in the strategy
+          parameters; what is missing is a configuration worth running, not the
+          engine.
+        </div>
+      ) : positions.length === 0 ? (
+        <div className="rounded-xl bg-[var(--surface)] px-3 py-2.5 text-[11px] text-[var(--muted)]">
+          Nothing open — waiting for a setup that passes every gate.
+          {engine === "scalp" && scalp && (
+            <span className="block mt-1 text-[9px]">
+              needs score {scalp.minScore.toFixed(2)}, confidence{" "}
+              {(scalp.minConfidence * 100).toFixed(0)}%, alignment{" "}
+              {(scalp.minAlignment * 100).toFixed(0)}% · targets{" "}
+              {(scalp.targetPct * 100).toFixed(1)}% then gives up after{" "}
+              {scalp.maxHoldBars} bars
             </span>
-            {rows.length > 0 ? (
-              <span className={`tnum text-[11px] ${tone(rows.reduce((a, r) => a + r.unrealised, 0))}`}>
-                {signed(rows.reduce((a, r) => a + r.unrealised, 0))}
-              </span>
-            ) : (
-              <span className="text-[9px] text-[var(--muted)]">{note}</span>
-            )}
-          </div>
-          {rows.length === 0 ? (
-            <div className="rounded-xl bg-[var(--surface)] px-3 py-2.5 text-[11px] text-[var(--muted)]">
-              nothing open
-            </div>
-          ) : (
-            <PositionRows positions={rows} />
           )}
-        </section>
-      ))}
+        </div>
+      ) : (
+        <PositionRows positions={positions} />
+      )}
     </div>
   );
 }
