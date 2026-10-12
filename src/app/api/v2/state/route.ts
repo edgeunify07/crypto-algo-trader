@@ -5,10 +5,13 @@ import {
   DEFAULT_LEVERAGE,
   STARTING_BALANCE,
   drawdown,
+  booksFrom,
   equity,
   newAccount,
+  syncCombined,
   unrealisedTotal,
   type AccountState,
+  type Books,
   type EquityPoint,
   type FuturesPosition,
   type FuturesTrade,
@@ -29,8 +32,9 @@ export const maxDuration = 30;
 export async function GET() {
   const store = kv();
 
-  const [account, positions, equityCurve, trades, params] = await Promise.all([
+  const [account, storedBooks, positions, equityCurve, trades, params] = await Promise.all([
     store.get<AccountState>(KEYS.account),
+    store.get<Books>(KEYS.books),
     store.get<FuturesPosition[]>(KEYS.positions),
     store.list<EquityPoint>(KEYS.equity, 500),
     store.list<FuturesTrade>(KEYS.trades, 100),
@@ -42,7 +46,8 @@ export async function GET() {
     }>(KEYS.params),
   ]);
 
-  const acct = account ?? newAccount(STARTING_BALANCE);
+  const books = booksFrom(storedBooks, account, STARTING_BALANCE);
+  const acct = syncCombined(account ?? newAccount(STARTING_BALANCE * 2), books);
   const open = positions ?? [];
 
   const marks: Record<string, number> = {};
@@ -72,6 +77,33 @@ export async function GET() {
             : 0,
         leverage: DEFAULT_LEVERAGE,
       },
+      /**
+       * Each engine's book, valued against only its own positions.
+       *
+       * Returned alongside the combined account rather than instead of it:
+       * the header is about the deployment, each tab is about one engine.
+       */
+      books: (["swing", "scalp"] as const).reduce(
+        (out, name) => {
+          const book = books[name];
+          const mine = open.filter((p) => (p.scalp === true) === (name === "scalp"));
+          const bookEquity = equity(book, mine, marks);
+          out[name] = {
+            ...book,
+            equity: bookEquity,
+            unrealised: unrealisedTotal(mine, marks),
+            drawdown: drawdown(book, bookEquity),
+            returnPct:
+              book.startingBalance > 0
+                ? (bookEquity - book.startingBalance) / book.startingBalance
+                : 0,
+            positions: mine.length,
+            trades: trades.filter((t) => (t.scalp === true) === (name === "scalp")).length,
+          };
+          return out;
+        },
+        {} as Record<string, unknown>,
+      ),
       positions: open.map((p) => {
         const mark = marks[p.symbol] ?? p.entryPrice;
         const uPnl = unrealisedPnl({

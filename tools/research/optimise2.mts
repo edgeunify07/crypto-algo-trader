@@ -210,6 +210,18 @@ function sample(seed?: StrategyParams): StrategyParams {
     p.exit.takeProfitRMultiples = p.exit.takeProfitRMultiples
       .map((r) => Number(jitter(r, 0.5, 12).toFixed(2)))
       .sort((a, b) => a - b);
+    p.risk.riskPerTrade = jitter(p.risk.riskPerTrade, 0.005, 0.05);
+    p.risk.capitalPerTrade = jitter(p.risk.capitalPerTrade, 0.05, 0.35);
+    if (p.scalp.enabled) {
+      p.scalp.minScore = jitter(p.scalp.minScore, 0.3, 0.9);
+      p.scalp.minConfidence = jitter(p.scalp.minConfidence, 0.3, 0.9);
+      p.scalp.minAlignment = jitter(p.scalp.minAlignment, 0.3, 0.98);
+      p.scalp.targetPct = jitter(p.scalp.targetPct, 0.01, 0.12);
+      p.scalp.atrStopMultiple = jitter(p.scalp.atrStopMultiple, 0.5, 3);
+      p.scalp.maxHoldBars = Math.round(jitter(p.scalp.maxHoldBars, 4, 120));
+      p.scalp.closeFraction = jitter(p.scalp.closeFraction, 0.2, 1);
+      p.scalp.capitalShare = jitter(p.scalp.capitalShare, 0.1, 0.6);
+    }
     return sanitiseParams(p).params;
   }
 
@@ -244,6 +256,33 @@ function sample(seed?: StrategyParams): StrategyParams {
     Number((rung * (i + 1) * R(0.9, 1.5)).toFixed(2)),
   ).sort((a, b) => a - b);
   p.exit.takeProfitFractions = Array.from({ length: k }, () => 1 / k);
+
+  /**
+   * The scalp engine and the sizing caps, which this search used to leave at
+   * their defaults.
+   *
+   * Searching only the swing engine meant every trial inherited whatever the
+   * scalp happened to be set to — and for most of this project's life that
+   * was "off", so no trial could ever discover that turning it on at a tight
+   * score gate is worth several points of return. The risk cap was outside
+   * the search for a worse reason: nothing read it, so varying it would have
+   * changed nothing.
+   */
+  p.risk.riskPerTrade = R(0.005, 0.05);
+  p.risk.capitalPerTrade = R(0.05, 0.35);
+  p.scalp.enabled = P(0.6);
+  if (p.scalp.enabled) {
+    p.scalp.timeframes = P(0.5) ? ["15m", "1h"] : ["5m", "15m"];
+    p.scalp.minScore = R(0.3, 0.9);
+    p.scalp.minConfidence = R(0.3, 0.9);
+    p.scalp.minAlignment = R(0.3, 0.98);
+    p.scalp.targetPct = R(0.01, 0.12);
+    p.scalp.atrStopMultiple = R(0.5, 3);
+    p.scalp.maxHoldBars = RI(4, 120);
+    p.scalp.closeFraction = R(0.2, 1);
+    p.scalp.capitalShare = R(0.1, 0.6);
+    p.scalp.maxOpen = RI(1, 3);
+  }
   return sanitiseParams(p).params;
 }
 
@@ -335,6 +374,8 @@ interface Scored {
   compounded: number;
   worstDd: number;
   liq: number;
+  /** The largest single-trade loss, as a share of the $100 the window starts on. */
+  worstTrade: number;
 }
 const scored: Scored[] = [];
 
@@ -349,14 +390,24 @@ for (const [i, f] of finalists.entries()) {
     compounded: results.reduce((acc, r) => acc * (1 + r.totalReturn), 1) - 1,
     worstDd: Math.max(...results.map((r) => r.maxDrawdown)),
     liq: results.reduce((a, r) => a + r.liquidations, 0),
+    worstTrade: Math.min(0, ...results.flatMap((r) => r.trades.map((t) => t.netPnl / 100))),
   });
   if ((i + 1) % 10 === 0) console.log(`  ...${i + 1}/${finalists.length}`);
 }
 
 // Accept only what held up in at least three of the four windows, with no
 // liquidation anywhere; rank by median so one outlier cannot carry a candidate.
+/**
+ * `worstTrade` is the brief, not a nicety: one trade may cost at most 5% of
+ * the portfolio. It is checked on realised profit and loss rather than on
+ * `riskPerTrade`, because that setting sizes for a fill at the stop price and
+ * real stops fill worse — the shipped 5% setting produced a 6.87% loss, which
+ * is how this constraint came to be measured instead of assumed.
+ */
 const accepted = scored
-  .filter((s) => s.profitable >= 3 && s.liq === 0 && s.worstDd < 0.35)
+  .filter(
+    (s) => s.profitable >= 3 && s.liq === 0 && s.worstDd < 0.35 && s.worstTrade >= -0.05,
+  )
   .sort((a, b) => b.median - a.median);
 
 console.log(`\naccepted (>=3/4 windows profitable, no liquidations): ${accepted.length}`);

@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { KEYS, kv } from "@/lib/store/kv";
 import { isAuthorised } from "@/lib/engine2/guard";
-import { STARTING_BALANCE, newAccount } from "@/lib/store/account";
+import { STARTING_BALANCE, newAccount, newBooks } from "@/lib/store/account";
 
 /**
  * Reset the paper account back to its starting balance.
@@ -19,7 +19,10 @@ export async function POST(request: Request) {
 
   const store = kv();
   await Promise.all([
-    store.set(KEYS.account, newAccount(STARTING_BALANCE)),
+    // Each engine gets the same fresh stake; the combined account is their
+    // sum, so it starts at twice it.
+    store.set(KEYS.account, newAccount(STARTING_BALANCE * 2)),
+    store.set(KEYS.books, newBooks(STARTING_BALANCE)),
     store.set(KEYS.positions, []),
     store.del(KEYS.trades),
     store.del(KEYS.equity),
