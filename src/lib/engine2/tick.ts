@@ -107,6 +107,22 @@ export interface ScreenerRowLite {
     passed: boolean;
   }[];
   blockedBy: string | null;
+  /**
+   * The scalp engine's own read of this symbol.
+   *
+   * Separate from the fields above, which are the swing engine's. One row
+   * showing one set of numbers could only ever describe one of the two
+   * engines, and the dashboard would be quietly silent about whichever it
+   * left out.
+   */
+  scalp: {
+    score: number;
+    confidence: number;
+    alignment: number;
+    direction: string;
+    gates: { name: string; required: number | string; actual: number | string; passed: boolean }[];
+    blockedBy: string | null;
+  } | null;
   timeframes: Record<
     string,
     {
@@ -297,6 +313,9 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       id: newId("t"),
       symbol: position.symbol,
       side: position.side,
+      // Carried onto the trade so the two books can be read apart: a scalp
+      // that is stopped out exits as stop_loss like anything else.
+      scalp: position.scalp ?? false,
       style: position.style,
       timeframe: position.timeframe,
       quantity: qty,
@@ -382,6 +401,8 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
   // --- 3. Analyse the universe ----------------------------------------
   const screener: ScreenerRowLite[] = [];
   const analyses = new Map<string, ReturnType<typeof aggregate>>();
+  /** The scalp engine's own read of each symbol, from its own timeframes. */
+  const scalpAnalyses = new Map<string, ReturnType<typeof aggregate>>();
 
   for (const symbol of managed) {
     const perTimeframe = new Map<Timeframe, TimeframeAnalysis>();
@@ -393,8 +414,28 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     }
     if (perTimeframe.size === 0) continue;
 
-    const blended = aggregate(perTimeframe, params);
+    /**
+     * Two engines, two blends, mirroring the backtester exactly.
+     *
+     * Each reads only its own timeframes, so a scalp signal is not the swing
+     * signal seen through a shorter lens.
+     */
+    const subset = (tfs: readonly string[]) => {
+      const m = new Map<Timeframe, TimeframeAnalysis>();
+      for (const tf of tfs) {
+        const a = perTimeframe.get(tf as Timeframe);
+        if (a) m.set(tf as Timeframe, a);
+      }
+      return m;
+    };
+    const swingTfs = subset(params.entry.timeframes);
+    if (swingTfs.size === 0) continue;
+
+    const blended = aggregate(swingTfs, params);
     analyses.set(symbol, blended);
+
+    const scalpTfs = params.scalp.enabled ? subset(params.scalp.timeframes) : new Map();
+    if (scalpTfs.size > 0) scalpAnalyses.set(symbol, aggregate(scalpTfs, params));
 
     const anchorTf = blended.anchor?.timeframe ?? ANALYSIS_TIMEFRAMES[0]!;
     const entry = universe.entries.find((e) => e.symbol === symbol);
@@ -470,6 +511,49 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
     }
 
     const blockedBy = gates.find((g) => !g.passed)?.name ?? null;
+
+    // The same four checks, read off the scalp's own blend against its own
+    // thresholds, so each engine is answerable for its own numbers.
+    const sb = scalpAnalyses.get(symbol);
+    const scalpRead = sb
+      ? (() => {
+          const g: ScreenerRowLite["gates"] = [
+            {
+              name: "signal strength",
+              required: params.scalp.minScore.toFixed(2),
+              actual: Math.abs(sb.score).toFixed(2),
+              passed: Math.abs(sb.score) >= params.scalp.minScore,
+            },
+            {
+              name: "confidence",
+              required: pct(params.scalp.minConfidence),
+              actual: pct(sb.confidence),
+              passed: sb.confidence >= params.scalp.minConfidence,
+            },
+            {
+              name: "timeframe alignment",
+              required: pct(params.scalp.minAlignment),
+              actual: pct(sb.alignment),
+              passed: sb.alignment >= params.scalp.minAlignment,
+            },
+            {
+              name: "direction",
+              required: "long or short",
+              actual: sb.direction,
+              passed: sb.direction !== "flat",
+            },
+          ];
+          return {
+            score: sb.score,
+            confidence: sb.confidence,
+            alignment: sb.alignment,
+            direction: sb.direction,
+            gates: g,
+            blockedBy: g.find((x) => !x.passed)?.name ?? null,
+          };
+        })()
+      : null;
+
     screener.push({
       symbol,
       price: blended.anchor?.price ?? markBySymbol[symbol] ?? 0,
@@ -485,6 +569,7 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       hasPosition: positions.some((p) => p.symbol === symbol),
       gates,
       blockedBy,
+      scalp: scalpRead,
       timeframes: Object.fromEntries(
         [...perTimeframe.entries()].map(([tf, a]) => [
           tf,
@@ -689,25 +774,59 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
       }
 
       const blended = analyses.get(row.symbol);
-      const anchor = blended?.anchor;
-      if (!anchor || !blended) continue;
+      const scalpBlend = scalpAnalyses.get(row.symbol);
 
-      if (Math.abs(blended.score) < params.entry.minScore) continue;
-      if (blended.confidence < params.entry.minConfidence) continue;
-      if (blended.alignment < params.entry.minAlignment) continue;
+      /**
+       * Which engine, if either, wants this symbol.
+       *
+       * A symbol holds one position, so when both want it the swing engine
+       * takes it and the scalp trades what is left over. Offered the other
+       * way round, the scalp's looser gates meant it wanted nearly every
+       * symbol and the swing book all but disappeared.
+       */
+      const scalpSlots = positions.filter((p) => p.scalp).length;
+      const swingSlots = positions.length - scalpSlots;
 
-      const side: Side = blended.direction === "long" ? "long" : "short";
+      const swingWants =
+        !!blended &&
+        !!blended.anchor &&
+        swingSlots < limits.maxOpenPositions &&
+        blended.direction !== "flat" &&
+        Math.abs(blended.score) >= params.entry.minScore &&
+        blended.confidence >= params.entry.minConfidence &&
+        blended.alignment >= params.entry.minAlignment;
+
+      const scalpWants =
+        params.scalp.enabled &&
+        !!scalpBlend &&
+        !!scalpBlend.anchor &&
+        scalpSlots < params.scalp.maxOpen &&
+        scalpBlend.direction !== "flat" &&
+        Math.abs(scalpBlend.score) >= params.scalp.minScore &&
+        scalpBlend.confidence >= params.scalp.minConfidence &&
+        scalpBlend.alignment >= params.scalp.minAlignment;
+
+      if (!swingWants && !scalpWants) continue;
+      const isScalp = !swingWants && scalpWants;
+      const signal = (isScalp ? scalpBlend : blended) as NonNullable<typeof blended>;
+      const anchor = signal.anchor;
+      if (!anchor) continue;
+
+      const side: Side = signal.direction === "long" ? "long" : "short";
       if (side === "short" && !params.entry.allowShorts) continue;
 
-      // Elliott / Gann gates, when enabled.
-      if (params.entry.requireElliottAgreement) {
-        if (anchor.elliott.pattern === "none" || anchor.elliott.bias !== side) continue;
-      }
-      if (params.entry.requireGannAgreement && anchor.gann.bias !== side) continue;
-      if (params.entry.avoidGannTimeCycle) {
-        const { nearestCycle, distance, barsSinceAnchor } = anchor.gann.timeCycle;
-        const window = Math.max(1, Math.round(nearestCycle * 0.05));
-        if (nearestCycle > 0 && barsSinceAnchor > 0 && distance <= window) continue;
+      // Elliott / Gann gates, when enabled. The swing engine's only: a scalp
+      // is too short for a wave count or a Gann cycle to say much about it.
+      if (!isScalp) {
+        if (params.entry.requireElliottAgreement) {
+          if (anchor.elliott.pattern === "none" || anchor.elliott.bias !== side) continue;
+        }
+        if (params.entry.requireGannAgreement && anchor.gann.bias !== side) continue;
+        if (params.entry.avoidGannTimeCycle) {
+          const { nearestCycle, distance, barsSinceAnchor } = anchor.gann.timeCycle;
+          const window = Math.max(1, Math.round(nearestCycle * 0.05));
+          if (nearestCycle > 0 && barsSinceAnchor > 0 && distance <= window) continue;
+        }
       }
 
       const quoted = markBySymbol[row.symbol];
@@ -723,16 +842,6 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
        * makes the whole position honest rather than just its P&L.
        */
       const mark = slip(quoted, side, true, params.execution.slippageBps);
-
-      /**
-       * A scalp when the blend is unusually sure: tighter stop, a fixed
-       * percentage target and a short clock. The tighter stop is not a
-       * detail — keeping the swing stop would size the position down to hold
-       * the same risk over a move the scalp only needs a fraction of, and the
-       * trade would never clear its own fees.
-       */
-      const isScalp =
-        params.scalp.enabled && blended.confidence >= params.scalp.minConfidence;
 
       // Stop from ATR, then sized so the stop costs exactly riskPerTrade.
       const stopDistance =
@@ -864,12 +973,15 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
         style: isScalp ? "scalp" : (STYLE_BY_TIMEFRAME[anchor.timeframe] ?? "swing"),
         scalp: isScalp,
         paramsVersion,
+        // Read off whichever blend opened this, not always the swing one.
         reasons: [
           isScalp
-            ? `${side} ${row.symbol} scalp — confidence ${(blended.confidence * 100).toFixed(0)}%, ` +
-              `target ${(params.scalp.targetPct * 100).toFixed(1)}%, out within ${params.scalp.maxHoldBars} bars`
+            ? `${side} ${row.symbol} scalp on ${params.scalp.timeframes.join("/")} — ` +
+              `target ${(params.scalp.targetPct * 100).toFixed(1)}%, ` +
+              `${(params.scalp.closeFraction * 100).toFixed(0)}% of it, ` +
+              `out within ${params.scalp.maxHoldBars} bars`
             : `${side} ${row.symbol} ${anchor.timeframe} (${STYLE_BY_TIMEFRAME[anchor.timeframe] ?? "swing"})`,
-          `score ${blended.score.toFixed(2)}, alignment ${(blended.alignment * 100).toFixed(0)}%, ${anchor.regime.kind}`,
+          `score ${signal.score.toFixed(2)}, alignment ${(signal.alignment * 100).toFixed(0)}%, ${anchor.regime.kind}`,
           `Elliott ${anchor.elliott.pattern}/${anchor.elliott.currentWave} bias ${anchor.elliott.bias} (${(anchor.elliott.confidence * 100).toFixed(0)}%)`,
           `Gann ${anchor.gann.bias}, bar ${anchor.gann.timeCycle.barsSinceAnchor} of ${anchor.gann.timeCycle.nearestCycle} cycle`,
         ],

@@ -74,6 +74,11 @@ export type ExitReason =
 export interface FuturesTrade {
   id: string;
   symbol: string;
+  /**
+   * Which engine opened it. Not inferable from `exitReason`, because a scalp
+   * that is stopped out exits as `stop_loss` like anything else.
+   */
+  scalp?: boolean;
   side: Side;
   style: TradeStyle;
   timeframe: Timeframe;

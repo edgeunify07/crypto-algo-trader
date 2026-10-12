@@ -199,10 +199,27 @@ describe("runFuturesBacktest scalp rule", () => {
    * Confidence never reaches 0.8 in practice, so these drive the rule from a
    * threshold low enough to fire. The behaviour under test is what a scalp
    * does once taken, not how often the blend is sure.
+   *
+   * The swing engine is pointed at timeframes the data does not hold, which
+   * silences it. That is not a convenience: the swing engine has priority on
+   * any bar both engines want, so leaving it loose on the only timeframe
+   * present means every candidate is taken as a swing and the scalp's exits
+   * are never exercised at all. These tests are about what a scalp does once
+   * it is open, so the swing engine is kept out of the way; the two running
+   * together is what the slot test below covers.
    */
   const withScalp = (over: Partial<typeof DEFAULT_PARAMS.scalp>) => ({
     ...TRADES_READILY,
-    scalp: { ...DEFAULT_PARAMS.scalp, enabled: true, minConfidence: 0.1, ...over },
+    entry: { ...TRADES_READILY.entry, timeframes: ["4h", "1d"] as Timeframe[] },
+    scalp: {
+      ...DEFAULT_PARAMS.scalp,
+      enabled: true,
+      timeframes: ["1h"] as Timeframe[],
+      minConfidence: 0.1,
+      minScore: 0.15,
+      minAlignment: 0.2,
+      ...over,
+    },
   });
 
   const common = { stepTimeframe: "1h" as const, startingBalance: 100 };
@@ -260,22 +277,84 @@ describe("runFuturesBacktest scalp rule", () => {
   });
 
   it("does nothing when disabled", () => {
-    const off = runFuturesBacktest(data, TRADES_READILY, common);
-    expect(off.trades.some((t) => t.exitReason.startsWith("scalp_"))).toBe(false);
-  });
-
-  it("does not disturb the swing book at the shipped threshold", () => {
-    // The shipped config is selective enough that it never triggers on this
-    // series, so the swing results have to come out bit-identical. If a
-    // future retune makes it fire here, this is the test that notices.
-    const shipped = runFuturesBacktest(
+    const off = runFuturesBacktest(
       data,
-      { ...TRADES_READILY, scalp: DEFAULT_PARAMS.scalp },
+      { ...withScalp({}), scalp: { ...withScalp({}).scalp, enabled: false } },
       common,
     );
-    const off = runFuturesBacktest(data, TRADES_READILY, common);
-    expect(shipped.trades.length).toBe(off.trades.length);
-    expect(shipped.totalReturn).toBeCloseTo(off.totalReturn, 10);
+    expect(off.trades.length).toBe(0);
+  });
+
+  it("holds its own position slots, so neither engine starves the other", () => {
+    // Both engines read the one timeframe the data holds, but the swing
+    // engine is choosy and the scalp is not, so the scalp picks up setups
+    // the swing engine passes on. Those trades have to be additional — a
+    // scalp engine that merely re-labels trades the swing engine would have
+    // taken anyway is the arrangement this split exists to avoid.
+    const scalp = {
+      ...DEFAULT_PARAMS.scalp,
+      enabled: true,
+      timeframes: ["1h"] as Timeframe[],
+      minScore: 0.15,
+      minConfidence: 0.1,
+      minAlignment: 0.2,
+      maxOpen: 2,
+    };
+    const bothEngines: StrategyParams = {
+      ...TRADES_READILY,
+      entry: { ...TRADES_READILY.entry, minScore: 0.3, minAlignment: 0.4 },
+      scalp,
+    };
+    const run = runFuturesBacktest(data, bothEngines, common);
+    const swingOnly = runFuturesBacktest(
+      data,
+      { ...bothEngines, scalp: { ...scalp, enabled: false } },
+      common,
+    );
+
+    const scalps = run.trades.filter((t) => t.scalp);
+    expect(scalps.length).toBeGreaterThan(0);
+    // Both engines are live, and together they trade more than the swing
+    // engine does alone.
+    expect(run.trades.some((t) => !t.scalp)).toBe(true);
+    expect(run.trades.length).toBeGreaterThan(swingOnly.trades.length);
+
+    // The scalp holds no more than its own allowance at a time, so it can
+    // never crowd the swing engine out of the book wholesale. A part-close
+    // reports as several trades off one position, so positions are counted
+    // by where they were opened.
+    const positions = new Map<string, { from: number; to: number }>();
+    for (const t of scalps) {
+      const key = `${t.symbol}@${t.openedAt}`;
+      const seen = positions.get(key);
+      positions.set(key, {
+        from: t.openedAt,
+        to: Math.max(seen?.to ?? t.closedAt, t.closedAt),
+      });
+    }
+    for (const at of [...positions.values()].map((p) => p.from)) {
+      const concurrent = [...positions.values()].filter(
+        (p) => p.from <= at && p.to >= at,
+      ).length;
+      expect(concurrent).toBeLessThanOrEqual(scalp.maxOpen);
+    }
+  });
+
+  it("reads its own timeframes, not the swing engine's", () => {
+    // The data holds only 15m bars. The swing engine is pointed at
+    // timeframes that are not there, so anything that trades is the scalp's
+    // — which is only possible because the two blends are built separately.
+    const fine = series(1500, () => 1_000, (i) => 100 * (1 + 0.0012 * i + 0.012 * Math.sin(i / 23)));
+    const r = runFuturesBacktest(
+      [{ symbol: "A", byTimeframe: new Map<Timeframe, Candle[]>([["15m", fine]]) }],
+      {
+        ...TRADES_READILY,
+        entry: { ...TRADES_READILY.entry, timeframes: ["4h", "1d"] },
+        scalp: { ...DEFAULT_PARAMS.scalp, enabled: true, timeframes: ["15m"], maxOpen: 3 },
+      },
+      { stepTimeframe: "15m", startingBalance: 100 },
+    );
+    expect(r.trades.length).toBeGreaterThan(0);
   });
 });
 

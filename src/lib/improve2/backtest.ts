@@ -36,6 +36,16 @@ export interface BacktestInput {
 export interface BacktestTrade {
   symbol: string;
   side: "long" | "short";
+  /**
+   * Which engine opened it.
+   *
+   * Not inferable from `exitReason`: a scalp that gets stopped out exits as
+   * `stop_loss` like any other, so counting only the `scalp_*` reasons
+   * tallies the winners and silently drops the losers — which made a scalp
+   * configuration that lost 30% of the account look like it was winning
+   * nine trades out of ten.
+   */
+  scalp: boolean;
   quantity: number;
   /** Margin committed to the slice being closed — the most it can lose. */
   margin: number;
@@ -219,6 +229,8 @@ export function runFuturesBacktest(
     startingBalance?: number;
     leverage?: number;
     riskPerTrade?: number;
+    /** Target share of equity committed as margin; the risk cap overrides. */
+    capitalPerTrade?: number;
     /**
      * Must match the live engine's limit. Without it the backtest happily runs
      * one position per symbol while production caps concurrency, so the
@@ -256,6 +268,7 @@ export function runFuturesBacktest(
     startingBalance = 100,
     leverage = 3,
     riskPerTrade = 0.02,
+    capitalPerTrade = params.risk.capitalPerTrade,
     maxOpenPositions = Number(process.env.MAX_OPEN_POSITIONS ?? "3"),
     maxDrawdownHalt = Number(process.env.MAX_DRAWDOWN ?? "0.3"),
     execution = params.execution,
@@ -370,6 +383,7 @@ export function runFuturesBacktest(
     trades.push({
       symbol,
       side: open.side,
+      scalp: open.scalp,
       quantity: qty,
       margin: marginShare,
       openedAt: open.openedAt,
@@ -425,8 +439,31 @@ export function runFuturesBacktest(
         if (a) perTimeframe.set(tf, a);
       }
       if (perTimeframe.size === 0) continue;
-      const blended = aggregate(perTimeframe, params);
-      const anchor = blended.anchor;
+
+      /**
+       * Two engines, two blends.
+       *
+       * Each reads only its own timeframes, so a scalp signal is not just
+       * the swing signal seen through a shorter lens. When they overlapped
+       * the scalp could only fire on setups the swing engine had already
+       * found and would have taken anyway, which is why every scalp it took
+       * cost more than it made.
+       */
+      const subset = (tfs: readonly string[]) => {
+        const m = new Map<Timeframe, TimeframeAnalysis>();
+        for (const tf of tfs) {
+          const a = perTimeframe.get(tf as Timeframe);
+          if (a) m.set(tf as Timeframe, a);
+        }
+        return m;
+      };
+
+      const swingTfs = subset(params.entry.timeframes);
+      const blended = swingTfs.size > 0 ? aggregate(swingTfs, params) : null;
+      const scalpTfs = params.scalp.enabled ? subset(params.scalp.timeframes) : new Map();
+      const scalpBlend = scalpTfs.size > 0 ? aggregate(scalpTfs, params) : null;
+      if (!blended && !scalpBlend) continue;
+      const anchor = blended?.anchor ?? null;
 
       // --- manage open position on the next bar ---
       if (st.open) {
@@ -517,9 +554,10 @@ export function runFuturesBacktest(
           }
         }
 
-        // Signal flip and time stop.
-        const against = open.side === "long" ? -blended.score : blended.score;
-        if (params.exit.exitOnScoreFlip > 0 && against >= params.exit.exitOnScoreFlip) {
+        // Signal flip and time stop, read off whichever blend opened this.
+        const own = open.scalp ? scalpBlend : blended;
+        const against = own ? (open.side === "long" ? -own.score : own.score) : 0;
+        if (own && params.exit.exitOnScoreFlip > 0 && against >= params.exit.exitOnScoreFlip) {
           close(d.symbol, st, slip(nextBar.close, open.side, false, execution.slippageBps), "signal_flip", 1, nextBar.closeTime);
           continue;
         }
@@ -544,40 +582,99 @@ export function runFuturesBacktest(
       // even if its symbol drops out of the ranking, which is what the live
       // engine does too.
       if (eligible && !eligible.get(now)?.has(d.symbol)) continue;
-      // Concurrency cap, matching the live risk manager.
-      const openCount = [...state.values()].filter((x) => x.open !== null).length;
-      if (openCount >= maxOpenPositions) continue;
-      if (!anchor || blended.direction === "flat") continue;
-      if (Math.abs(blended.score) < params.entry.minScore) continue;
-      if (blended.confidence < params.entry.minConfidence) continue;
-      if (blended.alignment < params.entry.minAlignment) continue;
+      /**
+       * Which engine, if either, wants this symbol.
+       *
+       * A symbol holds one position, so when both engines want it one must
+       * yield, and the swing engine takes it. That ordering is the whole
+       * difference between a scalp book that adds trades and one that
+       * replaces them: offered first instead, the scalp's looser gates meant
+       * it wanted nearly every symbol and the swing engine fell from 79
+       * trades to 8 — not outvoted, simply never asked. The scalp now trades
+       * what the swing passes on, and holds its own slots and its own share
+       * of the balance so the reverse cannot happen either.
+       */
+      const opens = [...state.values()].filter((x) => x.open !== null);
+      const scalpOpen = opens.filter((x) => x.open?.scalp).length;
+      const swingOpen = opens.length - scalpOpen;
 
-      const side = blended.direction === "long" ? "long" : "short";
+      const scalpWants =
+        params.scalp.enabled &&
+        scalpBlend !== null &&
+        scalpBlend.anchor !== null &&
+        scalpOpen < params.scalp.maxOpen &&
+        scalpBlend.direction !== "flat" &&
+        Math.abs(scalpBlend.score) >= params.scalp.minScore &&
+        scalpBlend.confidence >= params.scalp.minConfidence &&
+        scalpBlend.alignment >= params.scalp.minAlignment;
+
+      const swingWants =
+        blended !== null &&
+        anchor !== null &&
+        swingOpen < maxOpenPositions &&
+        blended.direction !== "flat" &&
+        Math.abs(blended.score) >= params.entry.minScore &&
+        blended.confidence >= params.entry.minConfidence &&
+        blended.alignment >= params.entry.minAlignment;
+
+      if (!scalpWants && !swingWants) continue;
+      const isScalp = !swingWants && scalpWants;
+      const signal = (isScalp ? scalpBlend : blended) as NonNullable<typeof blended>;
+      const useAnchor = signal.anchor;
+      if (!useAnchor) continue;
+
+      const side = signal.direction === "long" ? "long" : "short";
       if (side === "short" && !params.entry.allowShorts) continue;
-      if (params.entry.requireElliottAgreement &&
-          (anchor.elliott.pattern === "none" || anchor.elliott.bias !== side)) continue;
-      if (params.entry.requireGannAgreement && anchor.gann.bias !== side) continue;
+      // The structural filters are the swing engine's; a scalp is too short
+      // for a wave count or a Gann cycle to say anything useful about it.
+      if (!isScalp) {
+        if (params.entry.requireElliottAgreement &&
+            (useAnchor.elliott.pattern === "none" || useAnchor.elliott.bias !== side)) continue;
+        if (params.entry.requireGannAgreement && useAnchor.gann.bias !== side) continue;
+      }
 
       const quoted = nextBar.open;
-      /**
-       * A scalp when the blend is unusually sure. It takes a tighter stop as
-       * well as a fixed target: keeping the swing stop would size the
-       * position down to hold the same risk over a move it only needs a
-       * fraction of, and the trade would never pay for its fees.
-       */
-      const isScalp =
-        params.scalp.enabled && blended.confidence >= params.scalp.minConfidence;
       // Crossing the spread to get in, before anything is sized off the price.
       const price = slip(quoted, side, true, execution.slippageBps);
       const stopMultiple = isScalp
         ? params.scalp.atrStopMultiple
         : params.exit.atrStopMultiple;
-      const stopDistance = anchor.atr * stopMultiple;
+      const stopDistance = useAnchor.atr * stopMultiple;
       if (!(stopDistance > 0) || !(price > 0)) continue;
       if (stopDistance / price > 0.9 / leverage) continue;
 
       const equityNow = equityNowRef;
-      let qty = (equityNow * riskPerTrade) / stopDistance;
+      /**
+       * Size is the smaller of two answers to different questions.
+       *
+       * `capitalPerTrade` asks how much of the account this position should
+       * use; `riskPerTrade` asks how much may be lost if its stop is hit.
+       * Taking the allocation alone would size a wide-stopped trade exactly
+       * as large as a tight-stopped one and lose several times as much on
+       * it, so whichever is smaller wins and the wider stop simply buys less.
+       */
+      const byRisk = (equityNow * riskPerTrade) / stopDistance;
+      const byCapital = (equityNow * capitalPerTrade * leverage) / price;
+      let qty = Math.min(byRisk, byCapital);
+
+      /**
+       * Each engine spends from its own share of the account.
+       *
+       * Slots alone did not separate them: the scalp holding its two
+       * positions continuously left so little free margin that the swing
+       * engine fell from 79 trades to 3. It was not outvoted, it was priced
+       * out. A budget per engine is what makes them independent.
+       */
+      const committed = [...state.values()].reduce(
+        (sum, x) => sum + (x.open && x.open.scalp === isScalp ? x.open.margin : 0),
+        0,
+      );
+      const budget =
+        equityNow * (isScalp ? params.scalp.capitalShare : 1 - params.scalp.capitalShare);
+      const room = budget - committed;
+      if (!(room > 0)) continue;
+      const maxQtyForBudget = (room * leverage) / price;
+      qty = Math.min(qty, maxQtyForBudget);
       // Notional ceiling, as the live risk manager applies it.
       if (qty * price > equityNow * maxPositionFraction) {
         qty = (equityNow * maxPositionFraction) / price;
@@ -636,7 +733,7 @@ export function runFuturesBacktest(
         funding: 0,
         openedAt: nextBar.closeTime,
         lastFundingAt: nextBar.closeTime,
-        timeframe: anchor.timeframe,
+        timeframe: useAnchor.timeframe,
         scalp: isScalp,
       };
     }
