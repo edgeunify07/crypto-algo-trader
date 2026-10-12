@@ -182,8 +182,16 @@ export function booksFrom(
   legacy: AccountState | null | undefined,
   startingBalance = STARTING_BALANCE,
 ): Books {
-  if (stored?.swing && stored?.scalp) return stored;
-  if (legacy) return { swing: legacy, scalp: newAccount(startingBalance) };
+  if (stored?.swing && stored?.scalp) return { swing: { ...stored.swing }, scalp: { ...stored.scalp } };
+  /**
+   * Copied, never aliased.
+   *
+   * Returning `legacy` itself made the swing book and the combined account
+   * the same object, so `syncCombined` summed the pair into one of its own
+   * halves: the swing balance absorbed the scalp's stake on every call and
+   * compounded, turning two $100 books into a $500 account in a few ticks.
+   */
+  if (legacy) return { swing: { ...legacy }, scalp: newAccount(startingBalance) };
   return newBooks(startingBalance);
 }
 
@@ -196,6 +204,11 @@ export function booksFrom(
  * against — belongs to the pair and is kept as it was.
  */
 export function syncCombined(combined: AccountState, books: Books): AccountState {
+  // Summing into one of the halves being summed double-counts and compounds.
+  // Loud here beats a balance that quietly grows by the other book's stake.
+  if (combined === books.swing || combined === books.scalp) {
+    throw new Error("syncCombined: the combined account must not be one of the books");
+  }
   combined.balance = books.swing.balance + books.scalp.balance;
   combined.startingBalance = books.swing.startingBalance + books.scalp.startingBalance;
   combined.realisedPnl = books.swing.realisedPnl + books.scalp.realisedPnl;

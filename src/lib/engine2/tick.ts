@@ -246,7 +246,9 @@ export async function runTick(options: RunTickOptions = {}): Promise<TickResult>
    * is measured against — belongs to the pair and persists on its own.
    */
   const account: AccountState = syncCombined(
-    storedAccount ?? newAccount(STARTING_BALANCE * 2),
+    // Spread, because `booksFrom` may have been handed this same stored
+    // account to migrate: the combined view must never be one of the books.
+    storedAccount ? { ...storedAccount } : newAccount(STARTING_BALANCE * 2),
     books,
   );
   /** Positions belonging to one engine, for valuing its book alone. */
