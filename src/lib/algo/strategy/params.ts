@@ -257,7 +257,16 @@ export const StrategyParamsSchema = z.object({
      */
     capitalPerTrade: z.number().min(0.01).max(1).default(0.2),
     maxOpenPositions: z.number().int().min(1).max(20),
-    maxPositionFraction: z.number().min(0.01).max(1),
+    /**
+     * Notional ceiling for one position, as a multiple of equity.
+     *
+     * Above 1 on purpose: this is leveraged notional, not margin, so a $100
+     * account at 3x can hold $300 of contracts and a ceiling of 1 would be a
+     * tighter limit than `capitalPerTrade` ever asks for. The bound was 1,
+     * which made the 1.5 both engines actually run unrepresentable — the
+     * schema would have rejected the configuration being traded.
+     */
+    maxPositionFraction: z.number().min(0.01).max(3),
     /** Scale size down when ATR% exceeds this. */
     volatilityTargetAtrPct: z.number().min(0.002).max(0.2),
   }),
@@ -432,11 +441,41 @@ export const DEFAULT_PARAMS: StrategyParams = {
     stopSlippageBps: 15,
   },
   risk: {
-    riskPerTrade: 0.01,
-    // 20% of equity as margin per trade, capped by riskPerTrade above.
+    /**
+     * The brake: the most a stop-out may cost, as a share of equity.
+     *
+     * These three were dead settings until the engines were taught to read
+     * them — both read environment variables with hardcoded fallbacks, so the
+     * account was described here by one set of numbers and traded by another
+     * (2% risk, a 150% notional ceiling, three open positions). The values
+     * below are what the engines were actually doing, except where noted.
+     *
+     * Raised from the 2% that was running, to 5%, which is the brief: a
+     * single trade may cost at most 5% of the portfolio. It is a ceiling, not
+     * a target — `capitalPerTrade` below decides the size whenever it asks
+     * for less, which on a normal stop it does.
+     */
+    riskPerTrade: 0.05,
+    /**
+     * The ambition: margin to commit per trade, as a share of equity.
+     *
+     * At 3x this buys a notional of 60% of equity, so a stop 8.3% away costs
+     * exactly the 5% ceiling above and anything wider is sized down by it.
+     * The live engine ignored this entirely and sized on risk alone, which is
+     * why it and the backtester disagreed about every position.
+     */
     capitalPerTrade: 0.2,
-    maxOpenPositions: 5,
-    maxPositionFraction: 0.25,
+    /** Three, which is what the engine has always enforced. Was written 5. */
+    maxOpenPositions: 3,
+    /**
+     * Notional ceiling per position, as a multiple of equity.
+     *
+     * 1.5 is what both engines have been applying. Written as 0.25 here, it
+     * would have cut every position to a third of the size every measurement
+     * in this file was taken at — so it is corrected to the measured value
+     * rather than quietly changing how the account trades.
+     */
+    maxPositionFraction: 1.5,
     volatilityTargetAtrPct: 0.03,
   },
   scalp: {
