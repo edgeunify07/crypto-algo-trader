@@ -68,6 +68,14 @@ export const StrategyParamsSchema = z.object({
   timeframeWeights: z.record(z.string(), z.number().min(0).max(5)),
 
   entry: z.object({
+    /**
+     * Which timeframes the swing blend reads.
+     *
+     * Explicit so the two engines can genuinely differ: the scalp has its own
+     * list below, and without this they would both read everything and be the
+     * same signal wearing different exits.
+     */
+    timeframes: z.array(z.string()).min(1).max(8).default(["5m", "15m", "1h", "4h", "1d"]),
     /** |score| required on the anchor timeframe to consider a trade. */
     minScore: z.number().min(0.1).max(0.95),
     /** Blended confidence required. */
@@ -107,53 +115,69 @@ export const StrategyParamsSchema = z.object({
   }),
 
   /**
-   * High-conviction scalp: take a fixed percentage move and close.
+   * The scalp engine: its own timeframes, its own gates, its own slots.
    *
-   * Two measurements shape the defaults here, and the second is the reason
-   * the threshold is set where it is.
+   * Shipped disabled, because on this data it does not work.
    *
-   * `minConfidence` runs on the engine's own confidence scale, which is a
-   * weighted blend of per-timeframe confidences and not a probability. Over
-   * 120 days and 24 symbols it reached 0.80 six times in 6,768 evaluations
-   * and never passed 0.86, so a threshold chosen by intuition from the word
-   * "confidence" barely fires at all: 0.80 is roughly one trade a month.
+   * It began as a rule on the swing signal — same blend, same thresholds,
+   * just a shorter leash — which meant it could only fire on setups the
+   * swing engine had already found and would have taken anyway. Every scalp
+   * it took won, and every one of them left the account poorer, because it
+   * closed at a fixed 5% a position the swing exits would have carried
+   * further and paid a second taker fee to do it.
    *
-   * Lowering it to where it fires often costs money, which is not what the
-   * win rate suggests. Closing the *whole* position at the target, over 83
-   * out-of-sample days on one account:
+   * So it was rebuilt as a genuine second engine, reading 15m/1h while the
+   * swing engine reads 1h/4h/1d, with its own entry bar, its own position
+   * slots and its own share of the balance. Then 36 configurations of it
+   * were measured running alone, on the training window — the window they
+   * were searched over, where overfitting should flatter them:
    *
-   *     threshold   scalps   won    scalp P&L   account
-   *     off              0     —            —   +22.04%
-   *     >=0.72           4   4/4      +$10.86   +17.21%
-   *     >=0.70           9   9/9      +$23.90   +13.43%
-   *     >=0.68          14  14/14     +$52.51    +9.74%
+   *     minScore   stop    target   trades   won    return    PF
+   *       0.65     1.2 ATR   5%        23      8    -6.82%   0.31
+   *       0.65     2.5 ATR   5%        20      6   -11.51%   0.13
+   *       0.35     1.2 ATR   2%       205     84   -29.25%   0.55
+   *       0.50     1.2 ATR   2%       225     93   -30.69%   0.52
    *
-   * Every scalp won — 29 of 29 across that sweep — and each one left the
-   * account poorer. They are not losing trades; they are winning trades
-   * taken instead of better ones. A scalp pre-empts the swing entry on the
-   * same signal and closes at a fixed 5% a position the swing exits would
-   * have carried further, paying a second taker fee to do it. The profit is
-   * real and the opportunity cost is larger.
+   * All 36 lost. Every profit factor was below 1. This is not a tuning
+   * problem with a better corner somewhere; the region is negative.
    *
-   * `closeFraction` is the lever against exactly that, and it is what makes
-   * the rule affordable at a threshold where it actually fires. At 0.75:
+   * The likely reason is that 15m is not a scalp. Real scalping lives on 1m
+   * and 5m bars, and the backtest holds 15m at its finest — so what was
+   * measured here is a fast swing trade, which is the worst of both: too
+   * slow to catch a scalp's edge, too quick to let a swing's run develop.
+   * Judging a true scalp needs finer data than any of this was built on.
    *
-   *     close    scalps   won   scalp P&L   account
-   *     100%          2   2/2      +$3.58   +17.50%
-   *      75%          4   4/4      +$3.51   +19.93%
-   *      50%          4   4/4      +$4.17   +20.59%
-   *      25%          4   4/4      +$5.58   +21.96%
-   *
-   * Taking half at the target and leaving half on the swing ladder keeps the
-   * fast exit while giving up almost none of the run — the defaults below.
-   * Below 0.70 no fraction rescues it: the rule fires too often and the
-   * account lands near 15% whatever it closes.
-   */
-  scalp: z
+   * Everything it needs is here and tested. `enabled: true` turns it on, and
+   * the engine will trade it. The table above is why it is off.
+   */  scalp: z
     .object({
       enabled: z.boolean(),
-      /** Blended confidence at or above which a signal becomes a scalp. */
-      minConfidence: z.number().min(0.3).max(0.99),
+      /**
+       * The scalp's own timeframes, blended separately from the swing's.
+       *
+       * This is what makes it a second engine rather than a second exit. It
+       * was the swing signal with a shorter leash: same blend, same
+       * thresholds, so it could only ever fire on setups the swing engine
+       * had already found and would have taken anyway — which is why every
+       * scalp it took cost more than it made.
+       */
+      timeframes: z.array(z.string()).min(1).max(6),
+      /** Its own entry bar, read off its own blend. */
+      minScore: z.number().min(0.05).max(0.95),
+      minConfidence: z.number().min(0.2).max(0.99),
+      minAlignment: z.number().min(0).max(1),
+      /** Position slots of its own, so it cannot crowd out the swing book. */
+      maxOpen: z.number().int().min(0).max(10),
+      /**
+       * Share of equity the scalp book may commit as margin, in total.
+       *
+       * Separate slots are not enough, because the two engines spend the
+       * same balance. Measured: a scalp holding its two slots continuously
+       * left so little free margin that the swing engine went from 79 trades
+       * to 3 — it was not outvoted, it was priced out. This reserves the
+       * rest of the account for it.
+       */
+      capitalShare: z.number().min(0.05).max(0.9),
       /** Take profit at this fractional move in the position's favour. */
       targetPct: z.number().min(0.005).max(0.5),
       /** Give up after this many bars on the anchor timeframe. */
@@ -173,8 +197,13 @@ export const StrategyParamsSchema = z.object({
       closeFraction: z.number().min(0.1).max(1),
     })
     .default({
-      enabled: true,
-      minConfidence: 0.75,
+      enabled: false,
+      timeframes: ["15m", "1h"],
+      minScore: 0.35,
+      minConfidence: 0.45,
+      minAlignment: 0.6,
+      maxOpen: 2,
+      capitalShare: 0.25,
       targetPct: 0.05,
       maxHoldBars: 24,
       atrStopMultiple: 1.2,
@@ -210,7 +239,23 @@ export const StrategyParamsSchema = z.object({
     .default({ slippageBps: 2, stopSlippageBps: 15 }),
 
   risk: z.object({
+    /**
+     * The most a single stop-out may cost, as a fraction of equity.
+     *
+     * This is the cap, not the target. `capitalPerTrade` says how much of
+     * the account a position is meant to use; this says how much of it may
+     * be lost if the stop is hit, and the smaller of the two always wins. A
+     * fixed allocation without this would size a wide-stopped trade exactly
+     * as large as a tight-stopped one and lose several times as much on it.
+     */
     riskPerTrade: z.number().min(0.001).max(0.05),
+    /**
+     * Target share of equity to commit as margin on each position.
+     *
+     * With leverage this buys a notional several times larger, so it is the
+     * ambition and `riskPerTrade` is the brake.
+     */
+    capitalPerTrade: z.number().min(0.01).max(1).default(0.2),
     maxOpenPositions: z.number().int().min(1).max(20),
     maxPositionFraction: z.number().min(0.01).max(1),
     /** Scale size down when ATR% exceeds this. */
@@ -357,6 +402,9 @@ export const DEFAULT_PARAMS: StrategyParams = {
     "1w": 1.2,
   },
   entry: {
+    // The slow end of the board. The scalp engine owns the fast end, and
+    // overlapping them would make one a noisier copy of the other.
+    timeframes: ["1h", "4h", "1d"],
     minScore: 0.537952,
     minConfidence: 0.307368,
     minAlignment: 0.701781,
@@ -385,17 +433,27 @@ export const DEFAULT_PARAMS: StrategyParams = {
   },
   risk: {
     riskPerTrade: 0.01,
+    // 20% of equity as margin per trade, capped by riskPerTrade above.
+    capitalPerTrade: 0.2,
     maxOpenPositions: 5,
     maxPositionFraction: 0.25,
     volatilityTargetAtrPct: 0.03,
   },
   scalp: {
-    enabled: true,
-    minConfidence: 0.75,
+    // Off: all 36 measured configurations lost money. See the note above.
+    enabled: false,
+    // Fast relative to the swing engine's 1h/4h/1d, and blended on its own.
+    timeframes: ["15m", "1h"],
+    minScore: 0.35,
+    minConfidence: 0.45,
+    minAlignment: 0.6,
+    maxOpen: 2,
+    // A quarter of the account at most, so the swing book keeps the rest.
+    capitalShare: 0.25,
     targetPct: 0.05,
     maxHoldBars: 24,
     atrStopMultiple: 1.2,
-    // Half at the target, half left on the swing ladder — see the table above.
+    // Half at the target, half left on the swing ladder.
     closeFraction: 0.5,
   },
 };

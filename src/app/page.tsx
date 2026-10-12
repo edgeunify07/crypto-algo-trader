@@ -50,6 +50,15 @@ interface ScreenerRow {
   hasPosition: boolean;
   gates: { name: string; required: number | string; actual: number | string; passed: boolean }[];
   blockedBy: string | null;
+  /** The scalp engine's own read, from its own timeframes and thresholds. */
+  scalp?: {
+    score: number;
+    confidence: number;
+    alignment: number;
+    direction: string;
+    gates: { name: string; required: number | string; actual: number | string; passed: boolean }[];
+    blockedBy: string | null;
+  } | null;
   timeframes: Record<string, TfRead>;
 }
 
@@ -69,6 +78,8 @@ interface Position {
   distanceToLiquidation: number;
   notional: number;
   style: string;
+  /** Which engine opened it; the two books are shown separately. */
+  scalp?: boolean;
   timeframe: string;
   fundingPaid: number;
   openedAt: number;
@@ -698,6 +709,32 @@ function ChartSwitch({
   );
 }
 
+/** One engine's verdict on a symbol: what it is waiting for, or that it is ready. */
+function EngineLine({
+  label,
+  blocker,
+}: {
+  label: string;
+  blocker: { name: string; required: number | string; actual: number | string } | null;
+}) {
+  return (
+    <div className="flex items-baseline gap-1.5">
+      <span className="w-9 shrink-0 uppercase tracking-wide text-[var(--muted)]">{label}</span>
+      {blocker ? (
+        <span className="text-[var(--muted)]">
+          <span className="text-[var(--down)]">✕</span>{" "}
+          <span className="text-[var(--warn)]">{blocker.name}</span>{" "}
+          <span className="tnum text-[var(--text)]">{blocker.actual}</span>
+          {" · needs "}
+          <span className="tnum">{blocker.required}</span>
+        </span>
+      ) : (
+        <span className="text-[var(--up)]">every check passes — opens on the next run</span>
+      )}
+    </div>
+  );
+}
+
 function SignalHeadline({ row }: { row: ScreenerRow }) {
   const long = row.direction === "long";
   const flat = row.direction === "flat";
@@ -845,10 +882,55 @@ function Empty({ children }: { children: React.ReactNode }) {
   );
 }
 
+/**
+ * Open positions, with the two engines kept apart.
+ *
+ * They are different trades with different lifetimes — a swing position runs
+ * for days on a 1h/4h/1d read, a scalp is out within a day on 15m/1h — and
+ * mixed into one list neither book can be judged. Each section carries its
+ * own count and unrealised total so it is obvious at a glance which engine
+ * is making or losing the money.
+ */
 function LiveTab({ positions }: { positions: Position[] }) {
   if (positions.length === 0) {
-    return <Empty>No open positions — the engine is waiting for a qualified setup.</Empty>;
+    return <Empty>No open positions — both engines are waiting for a qualified setup.</Empty>;
   }
+  const swing = positions.filter((p) => !p.scalp);
+  const scalp = positions.filter((p) => p.scalp);
+  return (
+    <div className="space-y-3">
+      {[
+        { title: "Swing", rows: swing, note: "1h · 4h · 1d · runs to its targets" },
+        { title: "Scalp", rows: scalp, note: "15m · 1h · fixed target, short clock" },
+      ].map(({ title, rows, note }) => (
+        <section key={title} className="space-y-2">
+          <div className="flex items-baseline justify-between px-0.5">
+            <span className="text-[11px] font-medium">
+              {title}
+              <span className="ml-1.5 text-[var(--muted)]">{rows.length}</span>
+            </span>
+            {rows.length > 0 ? (
+              <span className={`tnum text-[11px] ${tone(rows.reduce((a, r) => a + r.unrealised, 0))}`}>
+                {signed(rows.reduce((a, r) => a + r.unrealised, 0))}
+              </span>
+            ) : (
+              <span className="text-[9px] text-[var(--muted)]">{note}</span>
+            )}
+          </div>
+          {rows.length === 0 ? (
+            <div className="rounded-xl bg-[var(--surface)] px-3 py-2.5 text-[11px] text-[var(--muted)]">
+              nothing open
+            </div>
+          ) : (
+            <PositionRows positions={rows} />
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+function PositionRows({ positions }: { positions: Position[] }) {
   return (
     <>
       {positions.map((p) => {
@@ -998,26 +1080,28 @@ function ScanTab({
                 </span>
               </div>
               {/*
-                The failing check with its numbers, not just its name. The
-                engine records the real reason a candidate was passed over —
-                including the sizing and leverage rules that used to reject
-                silently while this row still promised a trade.
+                One line per engine, because they disagree constantly and a
+                single verdict would be describing whichever one happened to
+                be shown. Each names its own failing check with its own
+                numbers.
               */}
-              <div className="mt-1 text-[9px]">
+              <div className="mt-1 space-y-0.5 text-[9px]">
                 {r.hasPosition ? (
                   <span className="text-[var(--accent)]">position open — managing it</span>
-                ) : blocker ? (
-                  <span className="text-[var(--muted)]">
-                    <span className="text-[var(--down)]">✕</span>{" "}
-                    <span className="text-[var(--warn)]">{blocker.name}</span>{" "}
-                    <span className="tnum text-[var(--text)]">{blocker.actual}</span>
-                    {" · needs "}
-                    <span className="tnum">{blocker.required}</span>
-                  </span>
                 ) : (
-                  <span className="text-[var(--up)]">
-                    every check passes — opens on the next run
-                  </span>
+                  <>
+                    <EngineLine label="swing" blocker={blocker} />
+                    {r.scalp && (
+                      <EngineLine
+                        label="scalp"
+                        blocker={
+                          r.scalp.gates.find((g) => g.name === r.scalp?.blockedBy && !g.passed) ??
+                          r.scalp.gates.find((g) => !g.passed) ??
+                          null
+                        }
+                      />
+                    )}
+                  </>
                 )}
               </div>
             </button>
