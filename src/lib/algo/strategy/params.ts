@@ -415,7 +415,16 @@ export const DEFAULT_PARAMS: StrategyParams = {
     // overlapping them would make one a noisier copy of the other.
     timeframes: ["1h", "4h", "1d"],
     minScore: 0.537952,
-    minConfidence: 0.307368,
+    /**
+     * Raised from the 0.307 the search produced, which was too low to be a
+     * gate at all. Measured over the same 83 days, with everything else
+     * held: 0.31 returned -2.13%, 0.60 returned +5.20%, and the drawdown
+     * fell from 15.5% to 12.4%. Confidence here is a weighted blend of
+     * per-timeframe confidences, not a probability — it sits around 0.57 and
+     * has never been observed above 0.87, so 0.60 is a real filter and
+     * anything near 0.75 fires about a dozen times a quarter.
+     */
+    minConfidence: 0.6,
     minAlignment: 0.701781,
     minQuoteVolume24h: 50000000,
     requireElliottAgreement: false,
@@ -450,12 +459,30 @@ export const DEFAULT_PARAMS: StrategyParams = {
      * (2% risk, a 150% notional ceiling, three open positions). The values
      * below are what the engines were actually doing, except where noted.
      *
-     * Raised from the 2% that was running, to 5%, which is the brief: a
-     * single trade may cost at most 5% of the portfolio. It is a ceiling, not
-     * a target — `capitalPerTrade` below decides the size whenever it asks
-     * for less, which on a normal stop it does.
+     * The brief is that one trade may cost at most 5% of the portfolio. This
+     * is 3%, because 5% here does not produce a 5% loss.
+     *
+     * The number sizes the position so that a fill *at the stop price* costs
+     * exactly this much. Real stops fill worse: they trigger precisely when
+     * the market is moving against the position, and a gap fills at the bar's
+     * open rather than the trigger. Measured over the same 83 days:
+     *
+     *     riskPerTrade   worst single trade   return   max drawdown
+     *         1%              -1.33%          14.15%       6.0%
+     *         2%              -2.65%          14.65%      11.1%
+     *         3%              -4.14%          20.44%      15.2%
+     *         5%              -6.87%          22.64%      18.9%
+     *
+     * 5% overshoots the limit it is named after by nearly two points. 3%
+     * keeps the worst observed trade inside the 5% rule with room for a
+     * worse gap than this window happened to contain, and gives up about two
+     * points of return for it.
+     *
+     * It is a ceiling, not a target — `capitalPerTrade` below decides the
+     * size whenever it asks for less, which on any stop tighter than 5% of
+     * price it does.
      */
-    riskPerTrade: 0.05,
+    riskPerTrade: 0.03,
     /**
      * The ambition: margin to commit per trade, as a share of equity.
      *
@@ -479,12 +506,33 @@ export const DEFAULT_PARAMS: StrategyParams = {
     volatilityTargetAtrPct: 0.03,
   },
   scalp: {
-    // Off: all 36 measured configurations lost money. See the note above.
-    enabled: false,
+    /**
+     * On, at a tight score gate.
+     *
+     * The earlier note said every configuration lost money. That was true of
+     * the ones measured — score gates of 0.35 and 0.50 — and wrong as a
+     * claim about the engine. The gate is what decides it. Same swing
+     * settings, same 83 days:
+     *
+     *     scalp off                       +5.20%    77 trades
+     *     on, confidence 0.70 score 0.65  +14.65%  102 trades   book +$7.48
+     *     on, confidence 0.70 score 0.55   -3.60%  138 trades   book -$7.72
+     *
+     * Loose, it bleeds on volume; tight, it earns. It is a taker fee twice
+     * for a fraction of the move the swing exits aim at, so it has to be
+     * right much more often than they do, and only the best setups are.
+     *
+     * Minute bars were measured too — 1m/5m/15m, 27 configurations on real
+     * 1m data — and lost in every one, on training and out of sample alike,
+     * at a 14-20% win rate. A 1-ATR stop on a one-minute candle sits inside
+     * the spread noise, so the position is stopped by chatter before any
+     * move develops. Finer is worse, not better.
+     */
+    enabled: true,
     // Fast relative to the swing engine's 1h/4h/1d, and blended on its own.
     timeframes: ["15m", "1h"],
-    minScore: 0.35,
-    minConfidence: 0.45,
+    minScore: 0.65,
+    minConfidence: 0.7,
     minAlignment: 0.6,
     maxOpen: 2,
     // A quarter of the account at most, so the swing book keeps the rest.

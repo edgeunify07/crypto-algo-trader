@@ -20,10 +20,17 @@ describe("backtest cache fingerprint", () => {
         entry: { ...DEFAULT_PARAMS.entry, minScore: DEFAULT_PARAMS.entry.minScore + 0.01 },
       }),
     ).not.toBe(before);
+    // Derived from the current value rather than written out: a literal here
+    // was 0.7, and the day the default became 0.7 this assertion started
+    // comparing the defaults with themselves and passing for the wrong
+    // reason — which is the same mistake as the bug the fingerprint fixes.
     expect(
       fingerprint({
         ...DEFAULT_PARAMS,
-        scalp: { ...DEFAULT_PARAMS.scalp, minConfidence: 0.7 },
+        scalp: {
+          ...DEFAULT_PARAMS.scalp,
+          minConfidence: DEFAULT_PARAMS.scalp.minConfidence + 0.01,
+        },
       }),
     ).not.toBe(before);
   });
