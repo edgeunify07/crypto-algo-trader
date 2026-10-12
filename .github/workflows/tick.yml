@@ -57,10 +57,11 @@
 # needs changing: the route answers GET as well as POST, and takes no body,
 # no headers and no auth.
 #
-# Once that scheduler is confirmed green, DISABLE this workflow — Actions tab
-# → tick → ⋯ → Disable workflow. Holding a runner open for six hours as a
-# redundant backup to something that already works is not what Actions is
-# for, and a tick arriving from both is wasted work either way.
+# This workflow stands down on its own once that scheduler is running. Every
+# run asks the account when it last ticked, and exits immediately if the
+# answer is recent — so while the external pinger is healthy this costs a few
+# seconds, and it only takes over for hours when the pinger has actually
+# stopped. There is nothing to disable and nothing to remember to re-enable.
 #
 # ---------------------------------------------------------------------------
 # Notes:
@@ -84,6 +85,11 @@ on:
         description: "Seconds between ticks"
         required: false
         default: "65"
+      force:
+        description: "Tick even if an external scheduler is already running"
+        required: false
+        type: boolean
+        default: false
 
 env:
   # The deployment this repository drives. A public URL, so it belongs in the
@@ -95,6 +101,10 @@ env:
   # Just past the endpoint's one-per-minute allowance for anonymous callers.
   # Below it the extra ticks are refused, not served.
   TICK_SECONDS: "65"
+  # A tick more recent than this means something else is already driving the
+  # loop, so this run has nothing to do. Generous enough that a pinger on a
+  # one-minute schedule never looks dead because one request timed out.
+  STALE_SECONDS: "420"
 
 # A slow tick must never have a second run pile up behind it. `cancel-in-
 # progress: false` is also what banks a scheduled fire that lands mid-run
@@ -115,6 +125,7 @@ jobs:
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           RUN_MINUTES: ${{ inputs.minutes || env.RUN_MINUTES }}
           TICK_SECONDS: ${{ inputs.interval || env.TICK_SECONDS }}
+          FORCE: ${{ inputs.force || false }}
         run: |
           set -euo pipefail
 
@@ -137,6 +148,38 @@ jobs:
           auth=()
           if [ -n "${CRON_SECRET:-}" ]; then
             auth=(-H "Authorization: Bearer ${CRON_SECRET}")
+          fi
+
+          # Stand down if something else is already driving the loop.
+          #
+          # Once an external scheduler is pointed at the endpoint this
+          # workflow is redundant, and a redundant run that holds a runner
+          # open for six hours is worse than redundant. So ask the account
+          # when it last ticked. A recent answer means the pinger is alive
+          # and there is nothing to do; a stale one — or no answer at all —
+          # means it is not, and this run takes over.
+          #
+          # Failing towards taking over is deliberate: a false takeover
+          # costs some runner time, a false stand-down costs a stop that
+          # nobody checks for hours.
+          if [ "${FORCE}" != "true" ]; then
+            last=$(curl --silent --max-time 30 "${APP_URL}/api/v2/state" \
+              | jq -r '.account.lastTickAt // 0' 2>/dev/null || echo 0)
+            case "$last" in (*[!0-9]*|"") last=0;; esac
+            if [ "$last" -eq 0 ]; then
+              # Unreachable, or an account that has never ticked. Printing an
+              # age here would be the epoch in seconds, which reads like a
+              # bug in the very log someone is checking during an outage.
+              echo "No tick on record (${APP_URL} did not answer, or the account is new) — taking over."
+            else
+              age=$(( $(date +%s) - last / 1000 ))
+              if [ "$age" -lt "$STALE_SECONDS" ]; then
+                echo "Last tick was ${age}s ago — an external scheduler is running. Standing down." \
+                  | tee -a "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+              echo "Last tick was ${age}s ago (threshold ${STALE_SECONDS}s) — taking over."
+            fi
           fi
 
           # Both are typed into a form on a manual run, so neither can be
