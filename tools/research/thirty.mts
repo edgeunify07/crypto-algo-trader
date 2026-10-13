@@ -1,15 +1,23 @@
 /**
- * Optimise each engine on its own, against the last 30 days.
+ * Optimise each engine on its own: every 30-day window above the target.
  *
- * The brief is a 15% return on the most recent month, per engine, searched
- * until it is reached. That is what this does — and because it searches the
- * same 30 days it reports, that number is fitted, not predicted. So every
- * candidate is also run over the three months *before* the search window,
- * which it never sees. The gap between the two columns is the whole story:
- * a real edge carries, a fitted one collapses.
+ * The brief is not a good month, it is four of them — 120 days cut into four
+ * consecutive 30-day windows, each required to clear 15% on its own. A
+ * candidate is scored by its *worst* window, so one spectacular month cannot
+ * carry three poor ones, which is exactly how every previous winner in this
+ * project got its headline number.
  *
- *   SEARCH  the last 30 days          — what was asked for
- *   BEFORE  the 90 days preceding it  — what it is worth
+ * That makes the target far harder and the result far more meaningful.
+ * Fitting one month out of noise is easy: several hundred trials over twenty
+ * free parameters will find a 15% month in almost any series, including a
+ * random one. Fitting four disjoint months to 15% each is not something luck
+ * supplies — a candidate that manages it is describing something that kept
+ * working as the market changed underneath it.
+ *
+ * It is still a search over the windows it reports, so the number is fitted
+ * rather than predicted. The honest reading is the spread across the four:
+ * an edge holds its shape, a fit shows one tall window and three scraping
+ * the bar.
  *
  * The engines are searched apart. The swing run disables the scalp; the
  * scalp run points the swing engine at timeframes the data does not hold, so
@@ -41,8 +49,21 @@ const all: BacktestInput[] = Object.entries(bySym).map(([symbol, m]) => ({
 const stepAll = all.flatMap((d) => d.byTimeframe.get(STEP) ?? []);
 const latest = Math.max(...stepAll.map((c) => c.closeTime));
 const earliest = Math.min(...stepAll.map((c) => c.closeTime));
-const searchFrom = latest - 30 * DAY;
 const day = (t: number) => new Date(t).toISOString().slice(0, 10);
+
+/**
+ * Four consecutive 30-day windows, newest last, covering the final 120 days.
+ *
+ * Consecutive and disjoint rather than overlapping: overlapping windows share
+ * trades, so a single good fortnight would lift two of them at once and the
+ * "every window" requirement would be weaker than it reads.
+ */
+const WINDOWS = Number(process.env.WINDOWS ?? "4");
+const windows = Array.from({ length: WINDOWS }, (_, i) => ({
+  from: latest - (WINDOWS - i) * 30 * DAY,
+  to: latest - (WINDOWS - i - 1) * 30 * DAY,
+}));
+const searchFrom = windows[0]!.from;
 
 const run = (p: StrategyParams, from: number, to: number) =>
   runFuturesBacktest(all, p, { stepTimeframe: STEP, startingBalance: 100, from, to, universeSize: UNIVERSE });
@@ -160,24 +181,33 @@ function sample(seed?: StrategyParams): StrategyParams {
   return sanitiseParams(p).params;
 }
 
-const worstTrade = (r: BacktestResult) => Math.min(0, ...r.trades.map((t) => t.netPnl / 100));
+const worstTrade = (rs: BacktestResult[]) =>
+  Math.min(0, ...rs.flatMap((r) => r.trades.map((t) => t.netPnl / 100)));
 
-console.log(`ENGINE=${ENGINE}  target ${(TARGET * 100).toFixed(0)}%  trials ${TRIALS}`);
-console.log(`data   ${day(earliest)} -> ${day(latest)}`);
-console.log(`SEARCH ${day(searchFrom)} -> ${day(latest)}  (the last 30 days)`);
-console.log(`BEFORE ${day(earliest)} -> ${day(searchFrom)}  (never searched)\n`);
+console.log(`ENGINE=${ENGINE}  every 30-day window >= ${(TARGET * 100).toFixed(0)}%  trials ${TRIALS}`);
+console.log(`data ${day(earliest)} -> ${day(latest)}`);
+windows.forEach((w, i) => console.log(`  W${i + 1}  ${day(w.from)} -> ${day(w.to)}`));
+console.log("");
 
-interface Hit { p: StrategyParams; ret: number; trades: number; dd: number; pf: number; worst: number }
+interface Hit {
+  p: StrategyParams;
+  /** The worst of the four windows. The score: a candidate is its weakest month. */
+  min: number;
+  rets: number[];
+  trades: number;
+  dd: number;
+  worst: number;
+}
 const hits: Hit[] = [];
 let best: StrategyParams | undefined;
-let bestRet = -Infinity;
+let bestMin = -Infinity;
 const started = Date.now();
 
 for (let i = 0; i < TRIALS; i++) {
   if (i > 0 && i % 25 === 0) {
     const per = (Date.now() - started) / i;
     console.log(
-      `  ...${i}/${TRIALS} best ${(bestRet * 100).toFixed(2)}% hits=${hits.length} ` +
+      `  ...${i}/${TRIALS} best worst-window ${(bestMin * 100).toFixed(2)}% hits=${hits.length} ` +
         `(${(per / 1000).toFixed(1)}s/trial, ~${(((TRIALS - i) * per) / 60000).toFixed(0)}m left)`,
     );
     if (hits.length > 0) {
@@ -187,35 +217,77 @@ for (let i = 0; i < TRIALS; i++) {
   }
   const p = sample(best);
   if (!StrategyParamsSchema.safeParse(p).success) continue;
-  const r = run(p, searchFrom, latest);
-  if (r.trades.length < 5 || r.liquidations > 0) continue;
-  if (r.totalReturn > bestRet) { bestRet = r.totalReturn; best = p; }
-  // The 5% per-trade rule still stands; a 15% month bought with 9% losses is
-  // not the thing that was asked for.
-  if (r.totalReturn >= TARGET && worstTrade(r) >= -0.05) {
-    hits.push({ p, ret: r.totalReturn, trades: r.trades.length, dd: r.maxDrawdown, pf: r.profitFactor, worst: worstTrade(r) });
-    hits.sort((a, b) => b.ret - a.ret);
+
+  /**
+   * Windows are run oldest first and abandoned as soon as one cannot be
+   * saved. Most candidates fail on their first window, and running the other
+   * three to confirm a failure already known costs three quarters of the
+   * search budget.
+   */
+  const rs: BacktestResult[] = [];
+  let viable = true;
+  for (const w of windows) {
+    const r = run(p, w.from, w.to);
+    rs.push(r);
+    if (r.liquidations > 0 || r.trades.length < 3) { viable = false; break; }
+    // Nothing recovers a window that is already below target.
+    if (r.totalReturn < TARGET && rs.length < windows.length) {
+      // Keep going only while it could still beat the best worst-window seen,
+      // which is what the search is climbing.
+      if (r.totalReturn <= bestMin) { viable = false; break; }
+    }
+  }
+  if (!viable || rs.length < windows.length) {
+    const partial = Math.min(...rs.map((r) => r.totalReturn));
+    if (rs.length === windows.length && partial > bestMin) { bestMin = partial; best = p; }
+    continue;
+  }
+
+  const rets = rs.map((r) => r.totalReturn);
+  const min = Math.min(...rets);
+  if (min > bestMin) { bestMin = min; best = p; }
+
+  // Every window at or above target, and the 5% per-trade rule intact: a 15%
+  // month bought with a 9% loss is not the thing that was asked for.
+  if (min >= TARGET && worstTrade(rs) >= -0.05) {
+    hits.push({
+      p, min, rets,
+      trades: rs.reduce((a, r) => a + r.trades.length, 0),
+      dd: Math.max(...rs.map((r) => r.maxDrawdown)),
+      worst: worstTrade(rs),
+    });
+    hits.sort((a, b) => b.min - a.min);
   }
 }
 
-console.log(`\n=== ${ENGINE.toUpperCase()}: ${hits.length} configurations cleared ${(TARGET * 100).toFixed(0)}% on the search window ===`);
-console.log(`best return seen anywhere: ${(bestRet * 100).toFixed(2)}%\n`);
+console.log(
+  `\n=== ${ENGINE.toUpperCase()}: ${hits.length} configurations held ` +
+    `>= ${(TARGET * 100).toFixed(0)}% in ALL ${windows.length} windows ===`,
+);
+console.log(`best worst-window seen: ${(bestMin * 100).toFixed(2)}%\n`);
 
 if (hits.length === 0) {
-  console.log("Nothing reached the target. Defaults stay.");
+  /**
+   * Said plainly rather than softened. The whole point of scoring a candidate
+   * by its weakest window is that it cannot be talked around: if nothing
+   * cleared the bar in all four, the strategy does not clear the bar, and the
+   * best single month found is not an answer to a question about every month.
+   */
+  console.log(
+    `No configuration cleared ${(TARGET * 100).toFixed(0)}% in every window. ` +
+      `The best any candidate managed in its WEAKEST month was ${(bestMin * 100).toFixed(2)}%.`,
+  );
+  console.log("Defaults stay.");
 } else {
-  console.log("rank  SEARCH-30d            BEFORE-90d           worst trade");
+  console.log(`rank  worst    ${windows.map((_, i) => `W${i + 1}`.padStart(8)).join("")}   trades  maxDD  worst trade`);
   for (const [i, h] of hits.slice(0, 10).entries()) {
-    const before = run(h.p, earliest, searchFrom);
     console.log(
-      `${String(i + 1).padStart(4)}  ${(h.ret * 100).toFixed(2).padStart(7)}% ${String(h.trades).padStart(3)}t ` +
-        `DD${(h.dd * 100).toFixed(1).padStart(5)}% PF${h.pf.toFixed(2).padStart(5)}  |  ` +
-        `${(before.totalReturn * 100).toFixed(2).padStart(8)}% ${String(before.trades.length).padStart(3)}t ` +
-        `DD${(before.maxDrawdown * 100).toFixed(1).padStart(5)}% PF${before.profitFactor.toFixed(2).padStart(5)} liq${before.liquidations}  |  ` +
-        `${(h.worst * 100).toFixed(2)}%`,
+      `${String(i + 1).padStart(4)}  ${(h.min * 100).toFixed(2).padStart(6)}% ` +
+        h.rets.map((r) => `${(r * 100).toFixed(2).padStart(7)}%`).join(" ") +
+        `   ${String(h.trades).padStart(4)}t  ${(h.dd * 100).toFixed(1).padStart(5)}%  ${(h.worst * 100).toFixed(2)}%`,
     );
   }
   fs.writeFileSync(`${OUT}/thirty-${ENGINE}.json`,
-    JSON.stringify({ at: Date.now(), engine: ENGINE, hits: hits.slice(0, 10) }, null, 2));
+    JSON.stringify({ at: Date.now(), engine: ENGINE, windows: windows.map((w) => [day(w.from), day(w.to)]), hits: hits.slice(0, 10) }, null, 2));
   console.log(`\nwrote ${OUT}/thirty-${ENGINE}.json`);
 }
