@@ -50,3 +50,31 @@ distinguish a stable region from a single lucky point. A parameter set that
 only works at exactly its tuned values is a curve fit.
 
 Expects `$OUT/klines.json` and `$OUT/best.json` from an optimisation run.
+
+## `thirty.mts`
+
+Optimises one engine against the most recent 30 days, and reports what the
+same parameters did on the three months before it.
+
+```bash
+set -a && . ./.env.local && set +a
+ENGINE=swing TRIALS=500 TARGET=0.15 OUT=/tmp/research npx tsx tools/research/thirty.mts
+ENGINE=scalp TRIALS=500 TARGET=0.15 OUT=/tmp/research npx tsx tools/research/thirty.mts
+```
+
+The two columns are the point. `SEARCH-30d` is the window the search ran on,
+so it is fitted rather than predicted: with several hundred trials over twenty
+free parameters, a 15% month is usually findable in any series, including a
+random one. `BEFORE-90d` is the stretch the search never sees, and it is what
+says whether the shape found was an edge or an accident. A candidate strong in
+both is worth deploying; one that is +20% in the first column and negative in
+the second is curve-fitting with a good headline.
+
+The engines are searched in isolation — the swing run disables the scalp, and
+the scalp run points the swing engine at a timeframe the cache does not hold,
+so it never forms a blend and never trades. The 5% per-trade loss limit is a
+hard constraint, checked on realised profit and loss: a 15% month bought with
+a 9% loss somewhere is not the thing that was asked for.
+
+Writes `$OUT/thirty-<engine>.json` with the ten best hits, checkpointed every
+25 trials so a restart costs minutes rather than the run.
